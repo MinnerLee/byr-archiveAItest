@@ -116,6 +116,9 @@ node src/index.js verify express@4.18.2      # 逐环节自检，退出码反映
 | `UPSTREAM_TIMEOUT` | `30000` | 上游请求超时（ms） |
 | `MAX_TARBALL_BYTES` / `MAX_FILE_BYTES` | 128MB / 64MB | 体积上限 |
 | `MAX_CONCURRENT_EXTRACT` / `MAX_EXTRACT_QUEUE` | `4` / `64` | 并发解包上限与队列上限 |
+| `VERIFY_INTEGRITY` | `true` | 是否校验下载 tarball 的 integrity / shasum |
+| `MINIFY_MAX_BYTES` | `4194304`（4MB） | 允许「即时压缩」的单文件上限，超过则跳过 |
+| `MINIFY_WORKERS` | `0`（自动） | 代码压缩线程池大小；自动 = min(CPU-1, 4) |
 | `RATE_LIMIT_PER_MINUTE` | `0`（关闭） | 每客户端每分钟额度；`>0` 开启令牌桶限流 |
 | `RATE_LIMIT_BURST` / `RATE_LIMIT_MAX_KEYS` | 同额度 / `10000` | 突发容量 / 最多跟踪的客户端数 |
 | `TRUST_PROXY` | `false` | 是否信任 `X-Forwarded-For`（反向代理后才该开） |
@@ -160,7 +163,10 @@ src/
   semver.js      自实现 semver 范围解析
   cache.js       两级缓存（内存 LRU + 磁盘、分类型 TTL、原子落盘）
   compress.js    gzip / brotli 内容协商与压缩缓存
-  minify.js      JS / CSS 词法级安全压缩器
+  minify.js      JS / CSS 词法级安全压缩器（同步实现）
+  minify-pool.js 代码压缩线程池（把 CPU 密集的压缩搬出主线程）
+  minify-worker.js  压缩 worker 入口
+  integrity.js   tarball 完整性校验（sha512-SRI / sha1，边流边算）
   bundle.js      打包器（Inline / Deep Inline / Rewrite 三种模式）
   entry.js       入口文件解析优先级链
   listing.js     目录列表页 / 服务首页
@@ -184,10 +190,21 @@ docs/
 ## 运行测试
 
 ```bash
-npm test                 # 118 项用例；无外网时自动跳过联网用例
-node test/benchmark.mjs  # 基准测量，打印体积/耗时/压缩率
+npm test                    # 118 项功能用例；无外网时自动跳过联网用例
+npm run test:acceptance     # 74 项对抗性验收（注入 / 越界 / 并发 / 中断 / 资源）
+npm run bench               # 基准测量，打印体积/耗时/压缩率
 node src/index.js verify <包>   # 对单个包做逐环节自检
+
+# 按包名查看某个包的解析结果
+node src/index.js info vue@3.3.4
 ```
+
+### 验收报告
+
+`docs/验收报告.md` 是依据《BYR Archive 后端验收提示词》做的自查：
+74 项对抗性检查、10 项缺陷记录（3 个 P1 已修复并复测）、以及**两处我自己判错并公开纠正的验收方法论问题**。
+
+> ⚠️ 该报告由开发者自审产出，不满足第三方验收的独立性要求，详见报告开头声明。
 
 ## 实测数据摘要
 
@@ -202,6 +219,8 @@ node src/index.js verify <包>   # 对单个包做逐环节自检
 | 打包（跨包） | `express/lib/express.js?bundle=deep` **144 模块 / 70 包 → 928KB**，产物可真实 `require` 并起 HTTP 服务 |
 | 限流 | 60/分钟 + 突发 5 → 第 6 个请求被拒，`Retry-After: 1s` |
 | 指标 | `/_metrics` 1.1ms 导出 16 个指标 / 54 个样本 |
+| 完整性 | 边流边算 sha512-SRI，篡改的 integrity 会被拒绝且不写入缓存 |
+| 事件循环 | 代码压缩搬到 worker 线程后，压缩期间主线程最大延迟从 537ms 降到 **32ms** |
 
 完整数据见 [`docs/benchmark-output.txt`](docs/benchmark-output.txt)。
 
@@ -212,6 +231,8 @@ node src/index.js verify <包>   # 对单个包做逐环节自检
 - **深度打包不处理 `package.json` 的 `browser` 字段**。
 - **压缩器不做混淆**。只做词法层面的安全压缩，不做变量重命名、死代码消除。
 - **限流默认关闭**。代码完整且有用例覆盖，但默认开启会误伤正常的批量构建脚本。
+- **`?bundle=deep` 无并发/频率配额**。有深度、模块数、字节数三重上限，但没有「每客户端打包频率」限制（见验收报告 DEF-006）。
+- **运维接口无鉴权**。`/_stats`、`/_metrics`、`/_api` 均可匿名访问（题面未要求鉴权；不含任何令牌明文）。
 - **不支持 scoped registry**（`@scope:registry`）。
 - **缓存无主动失效**。靠 TTL；版本化内容天然不可变，用 `immutable` + 长 TTL。
 

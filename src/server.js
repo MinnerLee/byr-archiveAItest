@@ -103,7 +103,14 @@ export function installGracefulShutdown(server) {
     shuttingDown = true;
     logger.info(`收到 ${signal}，停止接受新连接…`);
 
-    server.close(() => {
+    server.close(async () => {
+      // 先收掉压缩线程池，避免留下游离的 worker
+      try {
+        const pool = await import('./minify-pool.js');
+        await pool.shutdown();
+      } catch {
+        /* 忽略：退出路径上不值得因为清理失败而阻塞 */
+      }
       logger.info('所有连接已结束，进程退出');
       process.exit(0);
     });

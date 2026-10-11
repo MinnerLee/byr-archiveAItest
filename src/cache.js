@@ -140,6 +140,8 @@ const registryId = shortHash(config.registry, 12);
 const metaDir = path.join(config.cacheDir, registryId, 'meta');
 const pkgDir = path.join(config.cacheDir, registryId, 'pkg');
 const tmpDir = path.join(config.cacheDir, registryId, 'tmp');
+/** 派生产物（压缩 / 代码压缩结果）的磁盘缓存目录 */
+const blobDir = path.join(config.cacheDir, registryId, 'blob');
 
 /** 初始化缓存目录。 */
 export async function init() {
@@ -148,6 +150,7 @@ export async function init() {
     fsp.mkdir(metaDir, { recursive: true }),
     fsp.mkdir(pkgDir, { recursive: true }),
     fsp.mkdir(tmpDir, { recursive: true }),
+    fsp.mkdir(blobDir, { recursive: true }),
   ]);
   logger.debug(`缓存目录已就绪: ${config.cacheDir}`);
 }
@@ -203,6 +206,62 @@ export async function setMeta(key, value, ttl) {
     await fsp.rename(tmp, file);
   } catch (err) {
     logger.debug(`写入元信息缓存失败 ${file}: ${err.message}`);
+    await fsp.rm(tmp, { force: true }).catch(() => {});
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 派生产物（blob）缓存                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 读取一份派生产物（gzip / brotli / 压缩后的 JS）。
+ *
+ * 为什么要落盘？这些产物的生成成本很高（gzip 一个 300KB 的文件要几毫秒，
+ * 代码压缩一个 500KB 的文件要 500ms 以上），而它们**完全由输入决定**，
+ * 是天然的缓存对象。只放内存的话，进程一重启就要全部重算。
+ *
+ * TTL 用文件的 mtime 判断，不额外写 sidecar 元信息文件 —— 少一次 IO、
+ * 少一个可能与数据不一致的状态。
+ *
+ * @param {string} key 逻辑键
+ * @returns {Promise<Buffer|null>}
+ */
+export async function getBlob(key) {
+  const memKey = `blob:${key}`;
+  const cached = memory.get(memKey);
+  if (cached) return cached;
+
+  if (config.noCache || !config.diskCache) return null;
+
+  const file = path.join(blobDir, `${shortHash(key, 32)}.bin`);
+  try {
+    const stat = await fsp.stat(file);
+    if (Date.now() - stat.mtimeMs > config.ttl.compressed) return null;
+    const buffer = await fsp.readFile(file);
+    memory.set(memKey, buffer, config.ttl.compressed, buffer.length);
+    return buffer;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 写入一份派生产物。
+ * @param {string} key
+ * @param {Buffer} buffer
+ */
+export async function setBlob(key, buffer) {
+  memory.set(`blob:${key}`, buffer, config.ttl.compressed, buffer.length);
+  if (config.noCache || !config.diskCache) return;
+
+  const file = path.join(blobDir, `${shortHash(key, 32)}.bin`);
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fsp.writeFile(tmp, buffer);
+    await fsp.rename(tmp, file);
+  } catch (err) {
+    logger.debug(`写入 blob 缓存失败 ${file}: ${err.message}`);
     await fsp.rm(tmp, { force: true }).catch(() => {});
   }
 }
@@ -357,4 +416,6 @@ export default {
   extractInto,
   diskStats,
   readExtractedFile,
+  getBlob,
+  setBlob,
 };

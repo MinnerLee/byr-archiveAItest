@@ -31,6 +31,9 @@ export const forbidden = (msg, extra) => new HttpError(403, msg, extra);
 /** 413 超过体积上限。 */
 export const tooLarge = (msg, extra) => new HttpError(413, msg, extra);
 
+/** 503 服务暂时不可用（如解包队列已满），可重试。 */
+export const serviceUnavailable = (msg, extra) => new HttpError(503, msg, extra);
+
 /** 502 上游 registry 返回了异常结果。 */
 export const upstreamError = (msg, extra) => new HttpError(502, msg, extra);
 

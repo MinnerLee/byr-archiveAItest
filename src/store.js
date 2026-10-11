@@ -23,6 +23,9 @@ import { upstreamError, notFound, tooLarge, badRequest } from './errors.js';
 import { shortHash } from './util.js';
 import { createSemaphore } from './semaphore.js';
 import { metrics } from './metrics.js';
+import { createIntegrityChecker, describe as describeIntegrity } from './integrity.js';
+import { singleFlight } from './util.js';
+import { Transform } from 'node:stream';
 
 /**
  * 全局解包信号量。
@@ -85,7 +88,7 @@ async function flattenWrapperDir(dir) {
  * @param {string} tarballUrl
  * @returns {Promise<{dir:string, files:Array<{path:string,size:number}>, totalBytes:number}>}
  */
-async function materialize(name, version, tarballUrl) {
+async function materialize(name, version, tarballUrl, dist) {
   const cached = await cache.getExtracted(name, version);
   if (cached) {
     logger.debug(`解包结果命中磁盘缓存: ${name}@${version}`);
@@ -100,49 +103,112 @@ async function materialize(name, version, tarballUrl) {
   }
   metrics.cacheAccess('extracted', false);
 
-  logger.info(`下载并解包 ${name}@${version} ← ${tarballUrl}`);
+  /**
+   * 关键顺序：**先去重，再抢信号量名额**。
+   *
+   * 这里修掉了一个真实的并发缺陷：原来的写法是
+   *     await extractSemaphore.run(() => cache.extractInto(...))
+   * 而「同一包只解一次」的去重逻辑在 `cache.extractInto` **内部**。
+   * 后果是 N 个并发请求会先各自占掉一个信号量名额（或排进队列），
+   * 等轮到它们时才发现在去重表里被合并了 —— 队列额度被同一份工作白白吃光。
+   *
+   * 实测：100 个并发请求同一个冷包时，4 个执行 + 64 个排队 = 68 个占满队列，
+   * 剩下 32 个请求直接拿到 `E_QUEUE_FULL`。
+   *
+   * 把 singleFlight 提到信号量**外面**之后，N 个并发请求只剩 1 个进入信号量。
+   */
+  const dedupeKey = `materialize:${config.registry}|${name}@${version}`;
 
-  const startedAt = Date.now();
-  // 整段「下载 + 解包」都在信号量保护下，避免并发冷包把 CPU 与磁盘打满
-  try {
-    const result = await extractSemaphore.run(() =>
-      cache.extractInto(name, version, async (dir) => {
-        const { stream, contentLength } = await registry.openTarball(tarballUrl, config.maxTarballBytes);
-        if (contentLength) logger.debug(`tarball 体积 ${contentLength} 字节`);
+  return singleFlight(dedupeKey, async () => {
+    // 合并等待期间可能已经被别的请求解好了，二次确认避免重复劳动
+    const done = await cache.getExtracted(name, version);
+    if (done) {
+      return {
+        dir: done.dir,
+        files: done.files,
+        totalBytes: done.totalBytes,
+        storedAt: done.storedAt,
+      };
+    }
 
-        const unpacked = await tar.extractTgz(stream, dir, {
-          // npm 官方 registry 的条目统一以 `package/` 开头
-          stripPrefix: 'package/',
-          maxTotalBytes: config.maxTarballBytes * 8,
-          maxFileBytes: config.maxFileBytes,
-        });
+    logger.info(`下载并解包 ${name}@${version} <- ${tarballUrl}`);
+    const startedAt = Date.now();
 
-        await flattenWrapperDir(dir);
+    // 整段「下载 + 解包」都在信号量保护下，避免并发冷包把 CPU 与磁盘打满
+    try {
+      const result = await extractSemaphore.run(() =>
+        cache.extractInto(name, version, async (dir) => {
+          const { stream, contentLength } = await registry.openTarball(tarballUrl, config.maxTarballBytes);
+          if (contentLength) logger.debug(`tarball 体积 ${contentLength} 字节`);
 
-        // 拍平后文件清单可能变了，重新扫描一次磁盘，保证索引与磁盘一致
-        const files = await scanFiles(dir);
-        const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+          /**
+           * 完整性校验：边流边算哈希，不额外缓冲。
+           *
+           * 校验在**写入缓存之前**完成 —— 解包结果只有在完整、可信时才会
+           * 被 rename 到正式缓存目录；校验失败会抛错，由 extractInto 清理 staging。
+           */
+          const checker = config.verifyIntegrity ? createIntegrityChecker(dist) : null;
+          let source = stream;
+          if (checker) {
+            source = stream.pipe(
+              new Transform({
+                transform(chunk, _enc, cb) {
+                  checker.update(chunk);
+                  cb(null, chunk);
+                },
+              }),
+            );
+          }
 
-        logger.info(
-          `解包完成 ${name}@${version}: ${files.length} 个文件，共 ${totalBytes} 字节` +
-            (unpacked.skipped ? `（跳过 ${unpacked.skipped} 个非普通文件条目）` : ''),
-        );
+          const unpacked = await tar.extractTgz(source, dir, {
+            // npm 官方 registry 的条目统一以 `package/` 开头
+            stripPrefix: 'package/',
+            maxTotalBytes: config.maxTarballBytes * 8,
+            maxFileBytes: config.maxFileBytes,
+          });
 
-        return { files, totalBytes };
-      }),
-    );
+          if (checker) {
+            const verdict = checker.verify();
+            if (!verdict.ok) {
+              const failed = verdict.checks.filter((c) => !c.ok);
+              throw upstreamError(
+                `tarball 完整性校验失败（${name}@${version}）：` +
+                  failed.map((c) => `${c.algo} 期望 ${c.expected}，实际 ${c.actual}`).join('；') +
+                  '。已丢弃本次解包结果，不会写入缓存。',
+                { name, version, tarball: tarballUrl, checks: verdict.checks },
+              );
+            }
+            logger.debug(`完整性校验通过 ${name}@${version}: ${describeIntegrity(verdict)}`);
+          }
 
-    metrics.extraction({
-      ms: Date.now() - startedAt,
-      bytes: result.totalBytes,
-      files: result.files.length,
-      ok: true,
-    });
-    return result;
-  } catch (err) {
-    metrics.extraction({ ms: Date.now() - startedAt, bytes: 0, files: 0, ok: false });
-    throw err;
-  }
+          await flattenWrapperDir(dir);
+
+          // 拍平后文件清单可能变了，重新扫描一次磁盘，保证索引与磁盘一致
+          const files = await scanFiles(dir);
+          const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+
+          logger.info(
+            `解包完成 ${name}@${version}: ${files.length} 个文件，共 ${totalBytes} 字节` +
+              (unpacked.skipped ? `（跳过 ${unpacked.skipped} 个非普通文件条目）` : '') +
+              (checker ? '（完整性已校验）' : ''),
+          );
+
+          return { files, totalBytes };
+        }),
+      );
+
+      metrics.extraction({
+        ms: Date.now() - startedAt,
+        bytes: result.totalBytes,
+        files: result.files.length,
+        ok: true,
+      });
+      return result;
+    } catch (err) {
+      metrics.extraction({ ms: Date.now() - startedAt, bytes: 0, files: 0, ok: false });
+      throw err;
+    }
+  });
 }
 
 /** 递归扫描目录，产出「相对路径 + 大小」清单。 */
@@ -202,7 +268,7 @@ export async function loadPackage(name, versionSpec) {
     });
   }
 
-  const materialized = await materialize(name, version, tarballUrl);
+  const materialized = await materialize(name, version, tarballUrl, manifest.dist);
 
   return {
     name,

@@ -20,7 +20,7 @@ import * as store from './store.js';
 import * as cache from './cache.js';
 import * as mime from './mime.js';
 import * as compress from './compress.js';
-import * as minifyLib from './minify.js';
+import * as minifyPool from './minify-pool.js';
 import * as bundleLib from './bundle.js';
 import { parseRoute } from './router.js';
 import { renderListing, renderServiceIndex } from './listing.js';
@@ -139,17 +139,49 @@ function sendHtml(res, status, html, extraHeaders = {}, method = 'GET') {
   res.end(method === 'HEAD' ? undefined : body);
 }
 
+/**
+ * 把「非 HttpError 但语义明确的错误」翻译成合适的 HTTP 状态码。
+ *
+ * `E_QUEUE_FULL`（解包队列已满）是**可重试**的暂时性失败，
+ * 应该返回 503 + Retry-After，而不是 500 —— 后者会让客户端以为
+ * 「这个请求本身是坏的」，从而不去重试。
+ */
+const RETRYABLE_CODES = {
+  E_QUEUE_FULL: { status: 503, message: '服务繁忙：解包队列已满，请稍后重试', retryAfter: 1 },
+  E_TOO_LARGE: { status: 413, message: '请求的内容超过体积上限', retryAfter: 0 },
+};
+
 /** 发送错误响应。 */
 function sendError(res, err, method) {
-  const status = err instanceof HttpError ? err.status : 500;
-  const message = err instanceof HttpError ? err.message : '服务器内部错误';
+  const retryable = err && err.code ? RETRYABLE_CODES[err.code] : undefined;
+
+  let status;
+  let message;
+  if (err instanceof HttpError) {
+    status = err.status;
+    message = err.message;
+  } else if (retryable) {
+    status = retryable.status;
+    message = retryable.message;
+  } else {
+    status = 500;
+    message = '服务器内部错误';
+  }
+
   const payload = {
     error: message,
     status,
     ...(err instanceof HttpError ? err.extra : {}),
+    ...(retryable ? { code: err.code, retryable: true } : {}),
   };
+
+  // 4xx 是调用方的问题，不该刷 error 级别日志；5xx 才是服务端需要关注的
   if (status >= 500) logger.error('处理请求失败:', err.stack || err.message);
-  sendJson(res, status, payload, { 'cache-control': 'no-store' });
+
+  const extraHeaders = { 'cache-control': 'no-store' };
+  if (retryable && retryable.retryAfter > 0) extraHeaders['retry-after'] = String(retryable.retryAfter);
+
+  sendJson(res, status, payload, extraHeaders);
   if (method === 'HEAD') res.end();
 }
 
@@ -205,18 +237,45 @@ async function serveFile(req, res, pkg, relPath, route, options = {}) {
 
   let body = buffer;
   let minified = false;
+  let minifySkipped = '';
   const isMinifyCandidate = /\.(js|mjs|cjs|css)$/i.test(relPath);
 
   if (needMinify && isMinifyCandidate && config.minify) {
-    const result = minifyLib.minify(relPath, buffer.toString('utf8'));
-    body = Buffer.from(result.code, 'utf8');
-    minified = true;
-    if (result.original > 0) {
+    if (buffer.length > config.minifyMaxBytes) {
+      /**
+       * 体积闸门：代码压缩是**同步**的，会独占事件循环。
+       * 实测压缩 531KB 的 lodash.js 需要 500ms 以上，这期间该进程
+       * 无法处理任何其它请求。对一个要对外服务的 CDN 来说，
+       * 「一个匿名请求就能让服务僵住半秒」是不可接受的，所以给它一个上限：
+       * 超过就返回原文件并说明原因，让调用方自行决定是否离线压缩。
+       */
+      minifySkipped = 'too-large';
       logger.debug(
-        `压缩 ${relPath}: ${formatBytes(result.original)} → ${formatBytes(result.minified)}` +
-          `（${(result.ratio * 100).toFixed(1)}%）`,
+        `跳过即时压缩 ${relPath}（${formatBytes(buffer.length)} > 上限 ${formatBytes(config.minifyMaxBytes)}）`,
       );
-      metrics.minifySaved(Math.max(0, result.original - result.minified));
+    } else {
+      const minCacheKey = `min:${config.registry}|${pkg.name}@${pkg.version}/${relPath}`;
+      const cachedMin = await cache.getBlob(minCacheKey);
+
+      if (cachedMin) {
+        body = cachedMin;
+        minified = true;
+        metrics.cacheAccess('minify', true);
+      } else {
+        metrics.cacheAccess('minify', false);
+        // 走 worker 线程：压缩是 CPU 密集的，放主线程会独占事件循环
+        const result = await minifyPool.minify(relPath, buffer.toString('utf8'));
+        body = Buffer.from(result.code, 'utf8');
+        minified = true;
+        await cache.setBlob(minCacheKey, body);
+        if (result.original > 0) {
+          logger.debug(
+            `压缩 ${relPath}: ${formatBytes(result.original)} -> ${formatBytes(result.minified)}` +
+              `（降 ${((1 - result.ratio) * 100).toFixed(1)}%）`,
+          );
+          metrics.minifySaved(Math.max(0, result.original - result.minified));
+        }
+      }
     }
   }
 
@@ -286,6 +345,7 @@ async function serveFile(req, res, pkg, relPath, route, options = {}) {
   };
   if (entrySource) headers['x-byr-entry'] = `${relPath} (${entrySource})`;
   if (minified) headers['x-byr-minified'] = 'true';
+  if (minifySkipped) headers['x-byr-minify-skipped'] = minifySkipped;
   if (route.compat) headers['x-byr-url-style'] = 'jsdelivr';
 
   // ---- Range 请求：不压缩，返回 206 ----
@@ -609,6 +669,7 @@ export async function handleRequest(req, res) {
           memoryCache: cache.memory.stats(),
           diskCache: disk,
           extraction: store.extractStats(),
+          minifyPool: minifyPool.poolStats(),
           rateLimit: rateLimiter.stats(),
           metrics: metricsSnapshot(),
           config: {

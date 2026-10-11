@@ -97,7 +97,8 @@ export function shouldCompress(mime, size) {
 export async function compress(cacheKey, input, encoding) {
   const key = `${encoding}:${cacheKey}`;
 
-  const cached = cache.memory.get(key);
+  // 内存 + 磁盘两级：进程重启后不必重新压缩
+  const cached = await cache.getBlob(key);
   if (cached) return cached;
 
   const output = encoding === 'br'
@@ -105,7 +106,7 @@ export async function compress(cacheKey, input, encoding) {
     : await gzipAsync(input, GZIP_OPTIONS);
 
   // 压缩结果与内容一一对应且不可变，缓存时长跟文件本身一致
-  cache.memory.set(key, output, config.ttl.file, output.length);
+  await cache.setBlob(key, output);
   return output;
 }
 

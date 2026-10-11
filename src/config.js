@@ -99,6 +99,18 @@ export const config = {
   maxTarballBytes: readInt('MAX_TARBALL_BYTES', 128 * 1024 * 1024),
   /** 单个文件允许的最大响应体积，默认 64MB */
   maxFileBytes: readInt('MAX_FILE_BYTES', 64 * 1024 * 1024),
+  /**
+   * 是否校验下载 tarball 的完整性（对比 registry 元信息里的 integrity / shasum）。
+   * 默认开启 —— 传输损坏或中间篡改必须被发现，而不是被缓存 7 天持续对外提供。
+   */
+  verifyIntegrity: readBool('VERIFY_INTEGRITY', true),
+  /** 代码压缩线程池大小；0 表示自动（CPU 核数减一，最多 4 个） */
+  minifyWorkers: readInt('MINIFY_WORKERS', 0),
+  /**
+   * 允许「即时压缩」（?min）的单文件体积上限。
+   * 压缩是同步的，会阻塞事件循环；超过这个体积就不压，直接返回原文件并说明原因。
+   */
+  minifyMaxBytes: readInt('MINIFY_MAX_BYTES', 4 * 1024 * 1024),
   /** 并发解包上限，避免同时解多个大包把机器拖死 */
   maxConcurrentExtract: readInt('MAX_CONCURRENT_EXTRACT', 4),
   /** 解包等待队列长度上限，0 表示不限 */

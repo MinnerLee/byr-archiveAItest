@@ -35,7 +35,8 @@ import logger from './logger.js';
 import * as store from './store.js';
 import * as registry from './registry.js';
 import * as compress from './compress.js';
-import { tokenize, minifyJavaScript } from './minify.js';
+import { tokenize } from './minify.js';
+import { minify as minifyAsync } from './minify-pool.js';
 import { formatBytes, encodePathSegment } from './util.js';
 import { tooLarge } from './errors.js';
 import { metrics } from './metrics.js';
@@ -729,10 +730,20 @@ export async function bundleFile(pkg, entryPath, options = {}) {
 
   let minified = false;
   if (options.minify && config.minify) {
-    const result = minifyJavaScript(output);
-    output = result.code;
-    minified = true;
-    metrics.minifySaved(Math.max(0, result.original - result.minified));
+    // 与 handler 的 `?min` 同一道闸门：代码压缩是同步的，产物越大
+    // 阻塞事件循环越久（928KB 的 express 深度产物压缩需要数百毫秒）。
+    // 超过上限就不压，宁可返回未压缩的大文件，也不让一个匿名请求僵住整个服务。
+    if (Buffer.byteLength(output) > config.minifyMaxBytes) {
+      logger.debug(
+        `跳过打包产物的代码压缩（${Buffer.byteLength(output)} 字节 > 上限 ${config.minifyMaxBytes}）`,
+      );
+    } else {
+      // 同样走 worker 线程，避免一个打包请求把事件循环堵住
+      const result = await minifyAsync('bundle.js', output);
+      output = result.code;
+      minified = true;
+      metrics.minifySaved(Math.max(0, result.original - result.minified));
+    }
   }
 
   return {

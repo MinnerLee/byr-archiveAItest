@@ -1,0 +1,187 @@
+BYR Archive 对抗性验收测试
+Node v22.22.2 · 缓存目录 D:\BYR Archive\.byr-cache
+测试服务监听 127.0.0.1:9085
+
+A. 接口与输入边界（阶段 2：正常 / 边界 / 非法输入）
+──────────────────────────────────────────────────────────────────────────────
+  [PASS] 非法 URL 编码：截断的 UTF-8 百分号编码
+          /%E0%A4%A -> HTTP 400（期望 400 或 404，不得 500）
+  [PASS] 非法 URL 编码：非法十六进制
+          /%ZZ -> HTTP 400（期望 400 或 404，不得 500）
+  [PASS] 非法 URL 编码：UTF-8 overlong 编码的 ../
+          /%C0%AE%C0%AE/ -> HTTP 400（期望 400 或 404，不得 500）
+  [PASS] 超长 URL（10KB 路径）
+          -> HTTP 404
+  [PASS] 非法包名（单个连字符）
+          /-/ -> HTTP 400（期望 4xx，不得 5xx）
+  [PASS] 非法包名（只有 scope 前缀）
+          /@/ -> HTTP 400（期望 4xx，不得 5xx）
+  [PASS] 非法包名（超长多段路径）
+          /a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a -> HTTP 404（期望 4xx，不得 5xx）
+  [PASS] 非法包名（超长包名（300 字符））
+          /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa... -> HTTP 400（期望 4xx，不得 5xx）
+  [PASS] URL 规范化 new URL('/%2e%2e/', 'http://x').pathname = "/"
+          / -> HTTP 200；说明：URL 标准在解析阶段就把 %2e%2e / . 归一到父目录，因此请求根本到不了路径拼接逻辑（不是漏洞，但需在报告中说明判据）
+  [PASS] URL 规范化 new URL('/./', 'http://x').pathname = "/"
+          / -> HTTP 200；说明：URL 标准在解析阶段就把 %2e%2e / . 归一到父目录，因此请求根本到不了路径拼接逻辑（不是漏洞，但需在报告中说明判据）
+  [PASS] URL 规范化 new URL('/a/%2e%2e/b', 'http://x').pathname = "/b"
+          /b -> HTTP 404；说明：URL 标准在解析阶段就把 %2e%2e / . 归一到父目录，因此请求根本到不了路径拼接逻辑（不是漏洞，但需在报告中说明判据）
+  [PASS] Range: bytes=0-0（单字节）
+          -> HTTP 206，Content-Range: bytes 0-0/2592（期望 206 或 416）
+  [PASS] Range: bytes=-1（最后 1 字节）
+          -> HTTP 206，Content-Range: bytes 2591-2591/2592（期望 206 或 416）
+  [PASS] Range: bytes=999999999-（起点远超文件长度）
+          -> HTTP 416，Content-Range: bytes */2592（期望 206 或 416）
+  [PASS] Range: bytes=100-50（起止颠倒）
+          -> HTTP 416，Content-Range: bytes */2592（期望 206 或 416）
+  [PASS] Range: bytes=abc（非数字）
+          -> HTTP 200，Content-Range: (无)（期望 206 或 416）
+  [PASS] Range: bytes=0-1, 3-4（多区间（本实现不支持））
+          -> HTTP 200，Content-Range: (无)（期望 206 或 416）
+  [PASS] Range: bytes=0-99999999999（终点超大）
+          -> HTTP 206，Content-Range: bytes 0-2591/2592（期望 206 或 416）
+  [PASS] 越界访问 /vue@3.3.4/不存在的文件.js
+          -> HTTP 404（期望 404）
+  [PASS] 越界访问 /vue@99999.0.0/package.json
+          -> HTTP 404（期望 404）
+  [PASS] 越界访问 /nonexistent-pkg-byr-xyz/
+          -> HTTP 404（期望 404）
+  [PASS] 越界访问 /_api/vue@3.3.4/dir/不存在的目录
+          -> HTTP 404（期望 404）
+  [PASS] 越界访问 /_api/vue@3.3.4/file/不存在的文件
+          -> HTTP 404（期望 404）
+
+B. 注入与越权（阶段 5：安全审查）
+──────────────────────────────────────────────────────────────────────────────
+  [PASS] CRLF 头注入 /vue@3.3.4/%0d%0aX-Injected:%20yes
+          -> HTTP 404，x-injected 头存在=false（期望：不出现注入头且不返回 5xx）
+  [PASS] CRLF 头注入 /vue%0d%0aX-Injected:%20yes/package.json
+          -> HTTP 400，x-injected 头存在=false（期望：不出现注入头且不返回 5xx）
+  [PASS] CRLF 头注入 /vue@3.3.4/package.json%0d%0aX-Injected:%20yes
+          -> HTTP 404，x-injected 头存在=false（期望：不出现注入头且不返回 5xx）
+  [PASS] CRLF 头注入 /_api/vue@3.3.4/file/a%0d%0aX-Injected:%20yes
+          -> HTTP 404，x-injected 头存在=false（期望：不出现注入头且不返回 5xx）
+  [PASS] 路径穿越 /vue@3.3.4/../../../../etc/passwd
+          -> HTTP 404，body 是否含系统文件特征=false
+  [PASS] 路径穿越 /vue@3.3.4/..%2f..%2f..%2fetc%2fpasswd
+          -> HTTP 404，body 是否含系统文件特征=false
+  [PASS] 路径穿越 /vue@3.3.4/%2e%2e%2f%2e%2e%2fetc%2fpasswd
+          -> HTTP 404，body 是否含系统文件特征=false
+  [PASS] 路径穿越 /vue@3.3.4/....//....//etc/passwd
+          -> HTTP 404，body 是否含系统文件特征=false
+  [PASS] 路径穿越 /vue@3.3.4/..%252f..%252fetc%252fpasswd
+          -> HTTP 404，body 是否含系统文件特征=false
+  [PASS] 路径穿越 /vue@3.3.4/C:/Windows/win.ini
+          -> HTTP 404，body 是否含系统文件特征=false
+  [PASS] 路径穿越 /vue@3.3.4//etc/passwd
+          -> HTTP 404，body 是否含系统文件特征=false
+  [PASS] 错误响应不泄漏堆栈
+          404 body = {   "error": "未找到包 nonexistent-pkg-byr-xyz",   "status": 404,   "package": "nonexistent-pkg-byr-xyz" } 
+  [PASS] /_stats 不泄漏 registry 令牌
+          配置了令牌=false；响应中是否出现令牌明文=false
+  [PASS] 目录列表对恶意文件名做 HTML 转义
+          输出中出现未转义 <img> = false；未转义 <script> = false
+  [WARN] 运维接口 /_stats 无鉴权（设计如此，题面未要求）
+          HTTP 200 —— 任何人可读取缓存量、上游地址、限流开关等运维信息
+
+C. HTTP 语义边界（阶段 2：方法 / 协议）
+──────────────────────────────────────────────────────────────────────────────
+  [PASS] PUT 方法
+          -> HTTP 405（期望 405；TRACE 返回 501 也可接受）
+  [PASS] DELETE 方法
+          -> HTTP 405（期望 405；TRACE 返回 501 也可接受）
+  [PASS] PATCH 方法
+          -> HTTP 405（期望 405；TRACE 返回 501 也可接受）
+  [PASS] TRACE 方法
+          -> HTTP 405（期望 405；TRACE 返回 501 也可接受）
+  [PASS] OPTIONS 预检
+          -> HTTP 204
+  [PASS] GET 携带 100 字节请求体（协议合法的 chunked，手工构造）
+          HTTP/1.1 200 OK（超时）
+  [PASS] GET 携带 100 字节请求体（Content-Length）
+          HTTP/1.1 200 OK
+  [PASS] POST 携带 chunked 请求体 → 405（方法不允许，但协议被正确解析）
+          HTTP/1.1 405 Method Not Allowed
+  [PASS] 畸形 Accept-Encoding: "gzip;q=abc"
+          -> HTTP 200，Content-Encoding: gzip
+  [PASS] 畸形 Accept-Encoding: "br;;q="
+          -> HTTP 200，Content-Encoding: br
+  [PASS] 畸形 Accept-Encoding: "identity, *;q=0"
+          -> HTTP 200，Content-Encoding: (无)
+  [PASS] 畸形 Accept-Encoding: ""
+          -> HTTP 200，Content-Encoding: (无)
+
+D. 输出编码安全
+──────────────────────────────────────────────────────────────────────────────
+  [PASS] Content-Type 精确匹配 package.json
+          实际 "application/json; charset=utf-8"，期望 "application/json; charset=utf-8"
+  [PASS] Content-Type 精确匹配 vue.runtime.esm-browser.js
+          实际 "application/javascript; charset=utf-8"，期望 "application/javascript; charset=utf-8"
+  [PASS] Content-Type 精确匹配 README.md
+          实际 "text/markdown; charset=utf-8"，期望 "text/markdown; charset=utf-8"
+  [PASS] UTF-8 解码无替换字符（中文/特殊字符不乱码）
+          package.json 解码后是否含 U+FFFD = false
+
+E. 缓存一致性与中断恢复（阶段 3 / 6）
+──────────────────────────────────────────────────────────────────────────────
+  [PASS] 解包中途失败不产生半成品缓存
+          异常抛出=true；失败后 getExtracted=null；正式目录存在=false
+  [PASS] staging 临时目录被清理
+          残留 staging 目录数 = 0
+  [PASS] 同一包重复加载结果一致（幂等）
+          首次 10 文件/60080B（1ms）；二次 10 文件/60080B（0ms）
+  [PASS] 缓存文件内容与上游 tarball 逐字节一致（数据正确性抽查）
+          mime@3.0.0/package.json：本地 1115B vs 上游解包 1115B，SHA-256 相同=true
+  [PASS] 完整性校验器：正确内容判定为通过
+          checks = sha512(SRI):匹配, sha1(hex):匹配
+  [PASS] 完整性校验器：被篡改的内容判定为不通过
+          ok=false；失败项 = sha1(hex)
+  [PASS] 端到端：上游 integrity 被篡改时，服务拒绝该内容
+          loadPackage 抛出：tarball 完整性校验失败（is-number@7.0.0）：sha512(SRI) 期望 sha512-BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHB...
+  [PASS] 端到端：校验失败的内容不写入缓存
+          失败后 getExtracted(is-number@7.0.0) = null（未写入缓存）
+
+F. 资源与 DoS 面（阶段 6：健壮性）
+──────────────────────────────────────────────────────────────────────────────
+  [PASS] 内存缓存有字节上限且未超限
+          当前 1.2MB / 上限 64MB，条目 18，淘汰 0 次，命中率 43.9%
+  [PASS] 连续请求 400 个不同文件后内存受控
+          RSS 60MB -> 75MB（+15MB）；缓存占用 1.5MB ≤ 上限 64MB
+  [WARN] ?bundle=deep 的冷启动成本（无配额限制）
+          单次冷请求耗时 174ms、产物体积 928KB、涉及包数 70。该操作可被任意匿名者触发，每次都要下载并解包整棵依赖树；目前只有模块数/字节数上限，没有对「并发打包次数」或「每客户端打包频率」的限制。
+  [WARN] 同 URL 的 deep bundle 重复请求走缓存
+          冷 174ms -> 热 67ms（结果缓存在内存 LRU 中）
+  [PASS] 解包有并发上限与队列上限
+          limit=4，queued=0，peak=1
+
+G. 性能与事件循环阻塞（阶段 6）
+──────────────────────────────────────────────────────────────────────────────
+  [PASS] 热缓存下静态文件响应延迟（50 次顺序请求）
+          P50 1.1ms / P95 2.4ms / max 3.9ms
+  [PASS] 50 并发请求（热缓存）
+          总耗时 46ms，平均 0.9ms/请求，有效吞吐 1097 req/s
+  [PASS] `?min` 结果被缓存（清空缓存后：冷 vs 热）
+          冷 607ms -> 热 2.5ms；产物 146KB（原始 531KB）。缓存为「内存 LRU + 磁盘 blob」两级，进程重启后无需重算。
+  [PASS] 代码压缩不阻塞事件循环（worker 线程）
+          压缩 531KB 的 lodash.js 耗时 580ms（在 worker 里执行），期间主线程事件循环最大延迟 32ms、P99 31.6ms。（修复前实测为 537ms，即整段时间服务无法响应任何其它请求。）
+  [PASS] 压缩线程池状态可见
+          workers=4，busy=0，jobs=2，同步降级次数=0，超时=0，重启=0
+  [PASS] 超大文件跳过即时压缩（体积闸门）
+          阈值 4MB：超过则返回原文件并带 x-byr-minify-skipped: too-large 头，避免为一个大文件付出无上限的压缩成本
+
+H. 并发一致性（阶段 3：幂等 / 无重复）
+──────────────────────────────────────────────────────────────────────────────
+  [PASS] 100 并发请求同一冷包：响应完全一致
+          状态码集合 200；ETag 取值个数 1（应为 1）
+  [PASS] 100 并发请求同一冷包：只解包一次
+          解包完成计数 1 -> 2（增量 1，期望 ≤1）
+  [PASS] 并发冷包不突破解包并发上限
+          峰值并发 4 ≤ 上限 4
+  [PASS] 同一文件 5 次请求 ETag 一致
+          ETag 取值集合 = "016941a1438ebdf7c061"
+
+══════════════════════════════════════════════════════════════════════════════
+合计  74 PASS · 0 FAIL · 3 WARN
+══════════════════════════════════════════════════════════════════════════════
+
+临时目录：C:\Users\MINNER~1\AppData\Local\Temp
