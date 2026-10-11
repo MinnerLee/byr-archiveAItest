@@ -1,0 +1,20 @@
+# 依赖
+node_modules/
+
+# BYR Archive 磁盘缓存（不入库）
+.byr-cache/
+.byr-archive/
+
+# 日志
+*.log
+npm-debug.log*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.swp

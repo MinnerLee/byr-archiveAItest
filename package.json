@@ -1,0 +1,32 @@
+{
+  "name": "byr-archive",
+  "version": "1.0.0",
+  "description": "BYR Archive —— 一个最简版的 jsDelivr：从 npm registry 拉取包并直接对外提供文件、目录与入口文件服务",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "bin": {
+    "byr-archive": "./src/index.js"
+  },
+  "main": "./src/index.js",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node test/smoke.mjs"
+  },
+  "keywords": [
+    "jsdelivr",
+    "cdn",
+    "npm",
+    "registry",
+    "proxy"
+  ],
+  "license": "MIT",
+  "dependencies": {}
+}
