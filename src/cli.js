@@ -39,6 +39,30 @@ import { start, installGracefulShutdown } from './server.js';
 import { formatBytes } from './util.js';
 import { HttpError } from './errors.js';
 
+/**
+ * 是否给输出上色。
+ *
+ * **只在 stdout 是真正的 TTY 且未设置 `NO_COLOR` 时才上色。**
+ *
+ * 这不是"锦上添花"：原来的实现无条件输出 ANSI 转义序列，结果是
+ * `byr-archive verify xxx | grep 通过` 这类管道用法会被颜色码污染 ——
+ * 甚至让测试脚本的正则 `/(\d+)\/(\d+) 项通过/` 匹配失败，因为
+ * `5/9` 和 `项通过` 之间夹了一个 `\x1b[0m`。
+ * （这个缺陷就是在真实可用性验证里暴露的。）
+ *
+ * 遵循 https://no-color.org 约定。
+ */
+const useColor = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
+
+/** 上色：非 TTY 时原样返回，保证输出干净可管道。 */
+const color = {
+  bold: (s) => (useColor ? `\x1b[1m${s}\x1b[0m` : s),
+  green: (s) => (useColor ? `\x1b[32m${s}\x1b[0m` : s),
+  red: (s) => (useColor ? `\x1b[31m${s}\x1b[0m` : s),
+  blue: (s) => (useColor ? `\x1b[34m${s}\x1b[0m` : s),
+  gray: (s) => (useColor ? `\x1b[90m${s}\x1b[0m` : s),
+};
+
 /** 输出到 stdout（结果本身）。 */
 function out(text = '') {
   process.stdout.write(`${text}\n`);
@@ -302,11 +326,11 @@ async function commandLs(positional, flags) {
     return;
   }
 
-  out(`\x1b[1m${pkg.name}@${pkg.version}/${dir}\x1b[0m`);
-  for (const d of dirs) out(`  \x1b[34m${d}/\x1b[0m`);
+  out(color.bold(`${pkg.name}@${pkg.version}/${dir}`));
+  for (const d of dirs) out(`  ${color.blue(`${d}/`)}`);
   for (const f of files) {
     const tag = f.name === (() => { try { return store.resolveEntry(pkg).path.split('/').pop(); } catch { return ''; } })();
-    out(`  ${f.name}${tag ? '  \x1b[32m[入口]\x1b[0m' : ''}  \x1b[90m${formatBytes(f.size)}\x1b[0m`);
+    out(`  ${f.name}${tag ? `  ${color.green('[入口]')}` : ''}  ${color.gray(formatBytes(f.size))}`);
   }
 }
 
@@ -520,14 +544,15 @@ async function commandVerify(positional, flags) {
 
   const passed = results.filter((r) => r.ok).length;
   for (const r of results) {
-    out(`${r.ok ? '\x1b[32m✓\x1b[0m' : '\x1b[31m✗\x1b[0m'} ${r.label}${r.detail ? `  \x1b[90m${r.detail}\x1b[0m` : ''}`);
+    out(`${r.ok ? color.green('✓') : color.red('✗')} ${r.label}${r.detail ? `  ${color.gray(r.detail)}` : ''}`);
   }
   out('');
 
   if (flags['--json']) {
     out(JSON.stringify({ package: pkg.name, version: pkg.version, passed, total: results.length, results }, null, 2));
   } else {
-    out(`${pkg.name}@${pkg.version}: \x1b[1m${passed}/${results.length}\x1b[0m 项通过`);
+    // 注意：`N/M 项通过` 中间不能有任何颜色码 —— 外部脚本会 grep 这一行
+    out(`${pkg.name}@${pkg.version}: ${color.bold(`${passed}/${results.length}`)} 项通过`);
   }
 
   return passed === results.length;

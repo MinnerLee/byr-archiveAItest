@@ -182,7 +182,9 @@ src/
 test/
   smoke.mjs      120 项功能测试（单元 + 端到端，打真实 registry）
   acceptance.mjs 74 项对抗性验收（注入 / 越界 / 并发 / 中断 / 资源）
-  live-check.sh  70 项真实客户端验收（curl 打独立进程，任何人可复现）
+  verify-live.mjs   48 项独立进程验收（spawn 真实服务与 CLI 子进程）
+  live-check.sh     70 项真实客户端验收（curl 打独立进程，任何人可复现）
+  fixtures/         优雅退出探针等测试夹具
   benchmark.mjs  11 个方面的基准测量
 docs/
   开发记录.md     逐环节的实现记录：做法、实测效果、取舍、踩坑（20 个环节）
@@ -197,13 +199,14 @@ docs/
 ```bash
 npm test                    # ① 120 项功能用例（进程内）；无外网时自动跳过联网用例
 npm run test:acceptance     # ② 74 项对抗性验收（注入 / 越界 / 并发 / 中断 / 资源）
-npm run bench               # ④ 基准测量，打印体积/耗时/压缩率
+npm run test:live           # ③ 48 项独立进程验收（spawn 真实服务进程与 CLI 子进程）
+npm run bench               # ⑤ 基准测量，打印体积/耗时/压缩率
 
-# ③ 真实客户端验收（需先独立起服务，只用 curl）
+# ④ 真实客户端验收（需先独立起服务，只用 curl）
 PORT=18080 node src/index.js &
 bash test/live-check.sh http://127.0.0.1:18080
 
-# ⑤ 真实浏览器验收（用本机 Chrome 加载演示页）
+# ⑥ 真实浏览器验收（用本机 Chrome 加载演示页）
 #   chrome --headless=new --virtual-time-budget=25000 \
 #          --dump-dom "file:///<repo>/docs/browser-demo.html"
 
@@ -212,17 +215,18 @@ node src/index.js verify vue@3.3.4
 node src/index.js info vue@3.3.4
 ```
 
-### 五层验证
+### 六层验证
 
 | 层 | 命令 | 结果 |
 |---|---|---|
 | ① 功能 | `npm test` | 120 项通过 |
 | ② 对抗性 | `npm run test:acceptance` | 74 PASS / 0 FAIL / 3 WARN |
-| ③ 真实客户端（独立进程 + curl） | `bash test/live-check.sh` | 70 PASS / 0 FAIL |
-| ④ 基准 | `npm run bench` | 11 节数据 |
-| ⑤ 真实浏览器（Chrome） | `docs/browser-demo.html` | 11/11 通过 |
+| ③ 独立进程 | `npm run test:live` | 48 项通过 |
+| ④ 真实客户端（独立进程 + curl） | `bash test/live-check.sh` | 70 PASS / 0 FAIL |
+| ⑤ 基准 | `npm run bench` | 11 节数据 |
+| ⑥ 真实浏览器（Chrome） | `docs/browser-demo.html` | 11/11 通过 |
 
-每一层加的都不是「更多用例」，而是「**更多真实成分**」——第 ⑤ 层抓到了一个 Node 侧怎么测都测不到的缺陷。
+每一层加的都不是「更多用例」，而是「**更多真实成分**」——第 ⑥ 层抓到了一个 Node 侧怎么测都测不到的缺陷（`?esm` 非传递重写），第 ③ 层又抓出了 CLI 在非 TTY 下输出颜色码的问题。
 
 ### 验收报告
 

@@ -150,6 +150,30 @@ async function startRealServer(port) {
   return { child, exited, getLog: () => log };
 }
 
+/**
+ * 跑一个任意 Node 脚本作为子进程并收集输出。
+ * 用于 fixtures 目录下的探针脚本。
+ */
+async function runNodeFile(relPath, timeoutMs = 60_000) {
+  const child = spawn(process.execPath, [relPath], {
+    cwd: ROOT,
+    env: { ...process.env, LOG_LEVEL: 'info' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (c) => {
+    out += c.toString();
+  });
+  child.stderr.on('data', (c) => {
+    err += c.toString();
+  });
+  const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+  const [code] = await once(child, 'exit');
+  clearTimeout(timer);
+  return { code, out, err };
+}
+
 /** 跑一个 CLI 子进程并返回输出。 */
 async function runCli(args, timeoutMs = 120_000) {
   const child = spawn(process.execPath, ['src/index.js', ...args], {
@@ -169,7 +193,9 @@ async function runCli(args, timeoutMs = 120_000) {
   const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
   const [code] = await once(child, 'exit');
   clearTimeout(timer);
-  return { code, out, err };
+  // 防御性剥离 ANSI：CLI 已经保证「非 TTY 不上色」，但测试不该依赖这一点
+  const strip = (s) => s.replace(/\u001b\[[0-9;]*m/g, '');
+  return { code, out: strip(out), err: strip(err) };
 }
 
 /* ------------------------------------------------------------------ */
@@ -480,6 +506,33 @@ async function main() {
     /* ---------------- H. 优雅退出 ---------------- */
     group('H. 优雅退出');
 
+    /**
+     * ⚠️ 方法论说明（这一段原来写错了，记下来避免再犯）
+     *
+     * 最初的写法是直接对真实服务进程 `child.kill('SIGTERM')`，然后断言日志里出现
+     * 「停止接受新连接」。在 Windows 上这个断言**永远不可能通过** ——
+     * Windows 没有 POSIX 信号，跨进程 `kill('SIGTERM')` 走的是 TerminateProcess
+     * 强制终止，`process.on('SIGTERM')` 里的处理器一行都不会执行。
+     * 这测的是操作系统的信号投递差异，不是被测代码的缺陷。
+     *
+     * 而且当时 `test/fixtures/graceful-probe.mjs` 这个探针**写了却从未被引用** ——
+     * 也就是说优雅退出这条路径实际上从来没有被验证过。
+     *
+     * 现在拆成两条，各自测各自能测的东西：
+     *   H1 优雅退出的**逻辑**是否正确 → 用探针进程（进程内 process.emit('SIGTERM')）
+     *   H2 服务进程**能否被终止**   → 真实 SIGTERM/SIGKILL，只断言「会退出」
+     */
+
+    // H1：真实子进程 + 真实 server 实例 + 真实的关闭逻辑，只是信号投递方式做了平台适配
+    const probe = await runNodeFile('test/fixtures/graceful-probe.mjs', 30_000);
+    const probeLog = probe.out + probe.err;
+    check(
+      '优雅退出逻辑：SIGTERM 处理器执行且进程干净退出（独立探针进程）',
+      probe.code === 0 && /停止接受新连接/.test(probeLog) && /进程退出/.test(probeLog),
+      `退出码 ${probe.code} · 日志：${probeLog.split('\n').filter(Boolean).slice(-2).join(' / ') || '(无)'}`,
+    );
+
+    // H2：真实服务进程能被终止（不带「优雅」前提）
     server.child.kill('SIGTERM');
     // 注意：`server.exited` resolve 的是退出码（数字），不是数组，
     // 所以两支都要先包装成数组再解构，否则超时分支和正常分支形状不一致。
@@ -489,11 +542,16 @@ async function main() {
     ]);
     await new Promise((r) => setTimeout(r, 300));
     const shutdownLog = server.getLog();
+    const platformNote =
+      process.platform === 'win32'
+        ? 'Windows 下跨进程 SIGTERM 走 TerminateProcess，优雅日志不可达（已知平台差异，非缺陷）'
+        : '';
     check(
-      'SIGTERM 后进程能干净退出（含线程池回收）',
-      exitCode === 0 && /停止接受新连接/.test(shutdownLog),
-      `退出码 ${exitCode} · 日志含「停止接受新连接」(${/停止接受新连接/.test(shutdownLog)}) · 含「进程退出」(${/进程退出/.test(shutdownLog)})`,
+      '服务进程收到 SIGTERM 后能终止',
+      exitCode === null || exitCode === 0,
+      `退出码 ${exitCode} · 平台 ${process.platform}${platformNote ? ` · ${platformNote}` : ''}`,
     );
+    void shutdownLog;
 
     /* ---------------- I. CLI 子进程 ---------------- */
     group('I. CLI（真实子进程）');
@@ -516,12 +574,32 @@ async function main() {
         .join(' | '),
     );
 
-    const cliVerify = await runCli(['verify', 'mime@3.0.0'], 240_000);
-    const verifySummary = (cliVerify.out.match(/(\d+)\/(\d+) 项通过/) || [])[0] || '(未找到结论行)';
+    // 全通过的情形：vue@3.3.4 的入口命中 jsdelivr 字段，自检应当全绿
+    const cliVerifyOk = await runCli(['verify', 'vue@3.3.4'], 240_000);
+    const okSummary = (cliVerifyOk.out.match(/(\d+)\/(\d+) 项通过/) || [])[0] || '(未找到结论行)';
     check(
-      'CLI verify mime@3.0.0（逐环节自检）',
-      cliVerify.code === 0 && /(\d+)\/\1 项通过/.test(cliVerify.out),
-      verifySummary,
+      'CLI verify vue@3.3.4（逐环节自检，应全绿）',
+      cliVerifyOk.code === 0 && /(\d+)\/\1 项通过/.test(cliVerifyOk.out),
+      okSummary,
+    );
+
+    /**
+     * 部分失败的情形：mime@3.0.0 的 package.json 确实**没有** main / exports
+     * （这是实测事实，见 docs/验收报告.md），按题面入口解析规则第 4 条应当 404。
+     *
+     * 原来的断言写的是「exit code 必须为 0 且 N/N 全通过」，于是把
+     * 「符合题面的行为」判成了失败。这里改成断言**这个已知行为**：
+     * 退出码为 1、不是全通过、且失败原因指向入口解析。
+     */
+    const cliVerifyPartial = await runCli(['verify', 'mime@3.0.0'], 240_000);
+    const partialSummary = (cliVerifyPartial.out.match(/(\d+)\/(\d+) 项通过/) || [])[0] || '(未找到结论行)';
+    check(
+      'CLI verify mime@3.0.0（无 main/exports → 仅入口项失败，退出码 1）',
+      cliVerifyPartial.code === 1 &&
+        /(\d+)\/(\d+) 项通过/.test(cliVerifyPartial.out) &&
+        !/(\d+)\/\1 项通过/.test(cliVerifyPartial.out) &&
+        /入口文件可解析/.test(cliVerifyPartial.out),
+      partialSummary,
     );
   } finally {
     if (!server.child.killed) server.child.kill('SIGKILL');

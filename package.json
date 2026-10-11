@@ -31,6 +31,7 @@
     "dev": "node --watch src/index.js",
     "test": "node test/smoke.mjs",
     "test:acceptance": "node test/acceptance.mjs",
+    "test:live": "node test/verify-live.mjs",
     "bench": "node test/benchmark.mjs",
     "cli": "node src/index.js",
     "verify:lodash": "node src/index.js verify lodash",
