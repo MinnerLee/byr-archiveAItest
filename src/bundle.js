@@ -98,6 +98,25 @@ function isUrlLike(spec) {
   return URL_LIKE.test(spec);
 }
 
+/**
+ * Rewrite 模式用来「逐层继续重写」的查询参数后缀。
+ *
+ * 为什么必须带上它：`?esm` 的重写如果只作用于用户请求的那一个文件，
+ * 那么被重写出来的 `/npm/xxx/yyy.js`（不带参数）在浏览器里加载时，
+ * 拿到的又是原始文件 —— 它自己的裸说明符依然没被重写，浏览器报
+ * `Failed to resolve module specifier "..."`。
+ *
+ * 所以重写出来的 URL 必须带 `?esm`，让浏览器在逐层加载时，
+ * 我们的服务对每一层都再做一次重写。这样才是真正可用的传递式重写。
+ * （这个缺陷是真实浏览器验收时暴露的：见 docs/验收报告.md）
+ */
+const ESM_SUFFIX = '?esm';
+
+/** 只有 JS 类文件才需要带 ?esm —— JSON / CSS 等不是可重写的模块。 */
+function needsRewriteSuffix(filePath) {
+  return /\.(js|mjs|cjs)$/i.test(filePath);
+}
+
 /** 模块 id 生成规则：`包名@版本/包内路径`。 */
 function moduleId(name, version, filePath) {
   return `${name}@${version}/${filePath}`;
@@ -583,7 +602,7 @@ function emitInlineBundle(rootPkg, graph, extra = {}) {
  *
  * @param {import('./store.js').MaterializedPackage} pkg
  * @param {string} spec
- * @returns {Promise<string|null>}
+ * @returns {Promise<{url:string, path:string, name:string, version:string}|null>}
  */
 async function resolveBareSpecUrl(pkg, spec) {
   if (isUrlLike(spec)) return null;
@@ -596,7 +615,7 @@ async function resolveBareSpecUrl(pkg, spec) {
     if (!found) return null;
     const url = cdnUrl(found.pkg.name, found.pkg.version, found.path);
     logger.debug(`依赖锁定 ${spec} → ${found.pkg.name}@${found.pkg.version}/${found.path}`);
-    return url;
+    return { url, path: found.path, name: found.pkg.name, version: found.pkg.version };
   } catch (err) {
     logger.debug(`无法锁定依赖 ${spec}: ${err.message}`);
     return null;
@@ -629,36 +648,63 @@ async function emitRewrite(pkg, entryPath, source) {
   const rewrites = [];
   let internalCount = 0;
   let externalCount = 0;
+  let unresolvedCount = 0;
 
   for (const item of specifiers) {
     if (isRelativeSpec(item.spec)) {
       const target = resolveRelativeSpec(entryPath, item.spec, (p) => pkg.fileIndex.has(p));
       if (target) {
+        // 带上 ?esm：浏览器加载这一层时，服务会对它再做一次重写
         rewrites.push({
           start: item.start,
           end: item.end,
-          text: cdnUrl(pkg.name, pkg.version, target),
+          text: cdnUrl(pkg.name, pkg.version, target) + (needsRewriteSuffix(target) ? ESM_SUFFIX : ''),
         });
         internalCount += 1;
+      } else {
+        unresolvedCount += 1;
       }
       continue;
     }
 
-    const url = await resolveBareSpecUrl(pkg, item.spec);
-    if (url) {
-      rewrites.push({ start: item.start, end: item.end, text: url });
+    const resolved = await resolveBareSpecUrl(pkg, item.spec);
+    if (resolved) {
+      rewrites.push({
+        start: item.start,
+        end: item.end,
+        text: resolved.url + (needsRewriteSuffix(resolved.path) ? ESM_SUFFIX : ''),
+      });
       externalCount += 1;
+    } else {
+      unresolvedCount += 1;
     }
   }
 
   const output = applyRewrites(source, rewrites);
-  const banner =
-    `/*! BYR Archive · ${pkg.name}@${pkg.version} · entry=${entryPath}\n` +
-    ` * mode=rewrite · 已重写 ${internalCount} 个包内相对说明符、${externalCount} 个外部依赖\n` +
-    ` * 所有 import 路径已指向本服务并锁定到精确版本，可直接被浏览器作为 ES Module 加载。\n` +
-    ` */\n`;
+  const banner = [
+    `/*! BYR Archive · ${pkg.name}@${pkg.version} · entry=${entryPath}`,
+    ` * mode=rewrite · 已重写 ${internalCount} 个包内相对说明符、${externalCount} 个外部依赖` +
+      (unresolvedCount > 0 ? `，${unresolvedCount} 个未解析` : ''),
+    ' *',
+    ' * 本产物是「说明符重写」的结果，不是打包：',
+    ' *   - 包内相对路径 → 指向本服务的绝对 URL（带 ?esm，浏览器逐层加载时继续重写）；',
+    ' *   - 外部依赖   → 按引用方的 dependencies 解析出精确版本后指向本服务的绝对 URL；',
+    ' *   - Node 内置模块与无法解析的说明符保持原样（浏览器侧会失败，属预期）。',
+    ' *',
+    ' * ⚠️ 已知边界：只做「路径替换」，不做 CommonJS → ESM 的语义转换。',
+    ' *    因此只有「本身是 ESM、且依赖图里没有 CJS 模块」的包才能在浏览器里直接加载。',
+    ' *    例如 axios 的 Node 适配器依赖 form-data（CJS），其 ESM 图在浏览器中无法使用；',
+    ' *    而 nanoid 这类纯 ESM 包可以。需要通用解法请接入真正的打包器（rollup / esbuild）。',
+    ' */',
+    '',
+  ].join('\n');
 
-  return { output: banner + output, internalCount, externalCount };
+  return {
+    output: banner + output,
+    internalCount,
+    externalCount,
+    unresolvedCount,
+  };
 }
 
 /**
@@ -688,6 +734,8 @@ export async function bundleFile(pkg, entryPath, options = {}) {
   let external = 0;
   /** @type {string[]} */
   let unresolvedList = [];
+  /** Rewrite 模式下「未能解析」的说明符数量（浏览器侧会因此失败） */
+  let unresolvedSpecifiers = 0;
 
   if (mode === 'inline') {
     const graph = await collectGraph(pkg, entryPath, {
@@ -707,6 +755,10 @@ export async function bundleFile(pkg, entryPath, options = {}) {
       reason = `esm:${esmModule.path}`;
       modules = 1;
       external = rewritten.externalCount;
+      // 「说明符重写」是逐层进行的，但 Node 内置模块与解析不到的包会留原样。
+      // 把这个数字暴露出去，调用方就能一眼判断「这个 ESM 图能不能在浏览器里跑」。
+      unresolvedList = Array.from({ length: rewritten.unresolvedCount }, () => '<未解析>');
+      unresolvedSpecifiers = rewritten.unresolvedCount;
     } else {
       logger.info(
         `打包 ${pkg.name}@${pkg.version}/${entryPath}: ` +
@@ -726,6 +778,7 @@ export async function bundleFile(pkg, entryPath, options = {}) {
     modeName = 'rewrite';
     modules = 1;
     external = rewritten.externalCount;
+    unresolvedSpecifiers = rewritten.unresolvedCount;
   }
 
   let minified = false;
@@ -757,6 +810,8 @@ export async function bundleFile(pkg, entryPath, options = {}) {
     external,
     // 未内联的说明符列表（Node 内置模块会被排除），便于调用方判断产物是否真的自包含
     unresolved: unresolvedList,
+    // Rewrite 模式下未能解析的说明符数量；>0 表示该模块图在浏览器里跑不起来
+    unresolvedSpecifiers,
   };
 }
 
@@ -797,6 +852,11 @@ export async function serveBundle(req, res, pkg, entryId, route, options) {
     'x-powered-by': 'BYR Archive',
   };
   if (result.reason) headers['x-byr-bundle-reason'] = result.reason;
+  if (result.mode === 'rewrite') {
+    // 逐层重写是传递性的：每个被重写出的 URL 都带 ?esm
+    headers['x-byr-esm-transitive'] = 'true';
+    headers['x-byr-esm-unresolved'] = String(result.unresolvedSpecifiers || 0);
+  }
   if (result.minified) headers['x-byr-minified'] = 'true';
   if (config.cors) headers['access-control-allow-origin'] = '*';
   if (config.securityHeaders) headers['x-content-type-options'] = 'nosniff';

@@ -180,29 +180,57 @@ src/
   logger.js      分级日志
   util.js        单飞、哈希、HTML 转义等
 test/
-  smoke.mjs      118 项测试（单元 + 端到端，打真实 registry）
+  smoke.mjs      120 项功能测试（单元 + 端到端，打真实 registry）
+  acceptance.mjs 74 项对抗性验收（注入 / 越界 / 并发 / 中断 / 资源）
+  live-check.sh  70 项真实客户端验收（curl 打独立进程，任何人可复现）
   benchmark.mjs  11 个方面的基准测量
 docs/
-  开发记录.md     逐环节的实现记录：做法、实测效果、取舍、踩坑
-  benchmark-output.txt
+  开发记录.md     逐环节的实现记录：做法、实测效果、取舍、踩坑（20 个环节）
+  验收报告.md     第三方验收自查：11 项缺陷、五层验证、方法论修正
+  browser-demo.html  浏览器端验证演示页（用 jsDelivr 的写法引本服务）
+  browser-verify.png 浏览器验证截图
+  acceptance-output.txt / live-check-output.txt / benchmark-output.txt  原始实测输出
 ```
 
 ## 运行测试
 
 ```bash
-npm test                    # 118 项功能用例；无外网时自动跳过联网用例
-npm run test:acceptance     # 74 项对抗性验收（注入 / 越界 / 并发 / 中断 / 资源）
-npm run bench               # 基准测量，打印体积/耗时/压缩率
-node src/index.js verify <包>   # 对单个包做逐环节自检
+npm test                    # ① 120 项功能用例（进程内）；无外网时自动跳过联网用例
+npm run test:acceptance     # ② 74 项对抗性验收（注入 / 越界 / 并发 / 中断 / 资源）
+npm run bench               # ④ 基准测量，打印体积/耗时/压缩率
 
-# 按包名查看某个包的解析结果
+# ③ 真实客户端验收（需先独立起服务，只用 curl）
+PORT=18080 node src/index.js &
+bash test/live-check.sh http://127.0.0.1:18080
+
+# ⑤ 真实浏览器验收（用本机 Chrome 加载演示页）
+#   chrome --headless=new --virtual-time-budget=25000 \
+#          --dump-dom "file:///<repo>/docs/browser-demo.html"
+
+# 对单个包做逐环节自检
+node src/index.js verify vue@3.3.4
 node src/index.js info vue@3.3.4
 ```
+
+### 五层验证
+
+| 层 | 命令 | 结果 |
+|---|---|---|
+| ① 功能 | `npm test` | 120 项通过 |
+| ② 对抗性 | `npm run test:acceptance` | 74 PASS / 0 FAIL / 3 WARN |
+| ③ 真实客户端（独立进程 + curl） | `bash test/live-check.sh` | 70 PASS / 0 FAIL |
+| ④ 基准 | `npm run bench` | 11 节数据 |
+| ⑤ 真实浏览器（Chrome） | `docs/browser-demo.html` | 11/11 通过 |
+
+每一层加的都不是「更多用例」，而是「**更多真实成分**」——第 ⑤ 层抓到了一个 Node 侧怎么测都测不到的缺陷。
 
 ### 验收报告
 
 `docs/验收报告.md` 是依据《BYR Archive 后端验收提示词》做的自查：
-74 项对抗性检查、10 项缺陷记录（3 个 P1 已修复并复测）、以及**两处我自己判错并公开纠正的验收方法论问题**。
+**11 项缺陷记录（4 个 P1 全部已修复并复测）**、五层验证结果、以及**两处我自己判错并公开纠正的验收方法论问题**。
+
+其中 DEF-011（`?esm` 重写不是传递式的）是**真实浏览器验收**才抓出来的 ——
+Node 环境里那些没被重写的裸说明符恰好能从 `node_modules` 解析到，进程内测试会一路绿灯。
 
 > ⚠️ 该报告由开发者自审产出，不满足第三方验收的独立性要求，详见报告开头声明。
 
@@ -227,6 +255,7 @@ node src/index.js info vue@3.3.4
 ## 实现边界
 
 - **ESM 不做单文件合并**。需要完整的导入提升 + 活绑定实现（rollup / esbuild 量级），本项目改为「重写说明符为绝对 URL」（`?esm`），这正是 jsDelivr `+esm` 与 esm.sh 的做法。
+- **`?esm` 只做路径重写，不做 CJS→ESM 语义转换**。重写是传递式的（每层 URL 都带 `?esm`），但若依赖图里有 CommonJS 模块（如 axios 的 Node 适配器依赖 `form-data`），浏览器加载仍会失败。响应头 `x-byr-esm-unresolved` 会给出未能解析的说明符数量。纯 ESM 包（如 `nanoid`）可以完整跑通。
 - **深度打包不处理 Node 内置模块垫片**。产物在 Node 中完全可用；在浏览器中遇到 `require('fs')` 会抛出带说明的错误。
 - **深度打包不处理 `package.json` 的 `browser` 字段**。
 - **压缩器不做混淆**。只做词法层面的安全压缩，不做变量重命名、死代码消除。

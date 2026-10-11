@@ -931,6 +931,40 @@ async function testEndToEnd(port) {
     assert.ok(res.body.toString().includes('mode=rewrite'));
   });
 
+  await checkAsync('?esm 是「传递式」重写：重写出的 URL 必须带 ?esm（回归用例）', async () => {
+    // 这个缺陷是真实浏览器验收时暴露的：重写只作用于被请求的那一个文件，
+    // 于是浏览器加载第二层时拿到的仍是原始文件，裸说明符解析失败
+    // （Failed to resolve module specifier "form-data"）。
+    const res = await request(port, '/nanoid@5.0.4/index.browser.js?esm');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers['x-byr-esm-transitive'], 'true');
+
+    const code = res.body.toString();
+    const importSpecs = [...code.matchAll(/from\s+['"]([^'"]+)['"]/g)].map((m) => m[1]);
+    assert.ok(importSpecs.length > 0, `应至少有一个相对导入，实际 ${importSpecs.length} 个`);
+    assert.ok(
+      importSpecs.every((u) => u.startsWith('/npm/')),
+      `相对导入应被重写为指向本服务的绝对 URL：${importSpecs.join(', ')}`,
+    );
+    assert.ok(
+      importSpecs.every((u) => u.includes('?esm')),
+      `重写出的 URL 必须带 ?esm，否则下一层不会被重写：${importSpecs.join(', ')}`,
+    );
+  });
+
+  await checkAsync('?esm 暴露「未解析说明符数」，便于判断模块图能否在浏览器里跑', async () => {
+    const res = await request(port, '/axios@1.6.0/lib/adapters/http.js?esm');
+    assert.equal(res.status, 200);
+    const unresolved = Number(res.headers['x-byr-esm-unresolved'] ?? -1);
+    // http.js 依赖 Node 内置模块（http/https/zlib/stream...）与 form-data 等 CJS 包，
+    // 这些在浏览器里无法使用，必须能被计数出来而不是让人自己去猜。
+    assert.ok(unresolved >= 0, `x-byr-esm-unresolved 应为非负整数，实际 ${res.headers['x-byr-esm-unresolved']}`);
+    assert.ok(
+      res.body.toString().includes('已知边界'),
+      '产物横幅应写明 rewrite 模式的已知边界，避免过度承诺',
+    );
+  });
+
   await checkAsync('jsDelivr 兼容前缀 /npm/ 生效', async () => {
     const res = await request(port, '/npm/vue@3.3.4/package.json');
     assert.equal(res.status, 200);

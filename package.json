@@ -1,6 +1,6 @@
 {
   "name": "byr-archive",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "BYR Archive —— 一个最简版的 jsDelivr：从 npm registry 拉取包并直接对外提供文件、目录与入口文件服务",
   "type": "module",
   "engines": {
@@ -21,6 +21,8 @@
   },
   "files": [
     "src",
+    "test",
+    "docs",
     "README.md",
     "LICENSE"
   ],

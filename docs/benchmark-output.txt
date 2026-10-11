@@ -1,64 +1,64 @@
-[1mBYR Archive 基准测量[0m
+BYR Archive 基准测量
 Node v22.22.2 · 上游 https://registry.npmjs.org（来源 default）
 
-[1m1. 上游请求策略：精确版本 vs packument[0m
+1. 上游请求策略：精确版本 vs packument
 ────────────────────────────────────────────────────────────────────────
-  GET /vue/3.3.4（单版本 manifest）                   2.9KB · 221ms
-  GET /vue（简版 packument）                         866KB · 177ms
-  GET /vue（完整 packument）                         2.0MB · 147ms
+  GET /vue/3.3.4（单版本 manifest）                   2.9KB · 424ms
+  GET /vue（简版 packument）                         866KB · 157ms
+  GET /vue（完整 packument）                         2.0MB · 127ms
   -> 精确版本路径相比完整 packument 节省                     99.9%（2.0MB）
   -> 简版 packument 相比完整 packument 节省              58.1%
 
-[1m2. 下载 + 解包（冷路径）[0m
+2. 下载 + 解包（冷路径）
 ────────────────────────────────────────────────────────────────────────
-  lodash@4.17.21                                 1054 个文件 · 1.3MB · 618ms
-  vue@3.3.4                                      38 个文件 · 1.9MB · 166ms
-  axios@1.6.0                                    80 个文件 · 1.7MB · 166ms
+  lodash@4.17.21                                 1054 个文件 · 1.3MB · 890ms
+  vue@3.3.4                                      38 个文件 · 1.9MB · 158ms
+  axios@1.6.0                                    80 个文件 · 1.7MB · 351ms
 
-[1m3. 缓存效果（热路径，同一进程）[0m
+3. 缓存效果（热路径，同一进程）
 ────────────────────────────────────────────────────────────────────────
-  vue@3.3.4 二次加载（命中磁盘缓存）                         0.8ms
-  首次读取文件（磁盘）                                     0.39ms
-  再次读取文件（内存 LRU）                                 0.03ms
+  vue@3.3.4 二次加载（命中磁盘缓存）                         0.9ms
+  首次读取文件（磁盘）                                     0.33ms
+  再次读取文件（内存 LRU）                                 0.02ms
 
-[1m4. registry 元信息请求合并（single-flight）[0m
+4. registry 元信息请求合并（single-flight）
 ────────────────────────────────────────────────────────────────────────
   20 个并发 fetchManifest("react","18.2.0")（未预热）    实际发往 registry 的请求：1 次
   5 个并发的「冷包」loadPackage                          实际发往 registry 的请求：2 次（元信息 + tarball）
 
-[1m5. 传输压缩（gzip / brotli）[0m
+5. 传输压缩（gzip / brotli）
 ────────────────────────────────────────────────────────────────────────
   vue@3.3.4/vue.runtime.esm-browser.js           297KB -> gzip 69.9KB (24%) · br 66.6KB (22%)
   lodash@4.17.21/lodash.js                       531KB -> gzip 95.3KB (18%) · br 86.4KB (16%)
   axios@1.6.0/axios.js                           95.0KB -> gzip 24.3KB (26%) · br 23.6KB (25%)
 
-[1m6. JS 压缩（词法级安全压缩）[0m
+6. JS 压缩（词法级安全压缩）
 ────────────────────────────────────────────────────────────────────────
-  lodash@4.17.21/lodash.js                       531KB -> 146KB （降 72.5%，耗时 553ms）
+  lodash@4.17.21/lodash.js                       531KB -> 146KB （降 72.5%，耗时 622ms）
     语法校验                                         通过（node --check，按 CJS 解析）
-  vue@3.3.4/vue.global.js                        463KB -> 319KB （降 31.2%，耗时 2232ms）
+  vue@3.3.4/vue.global.js                        463KB -> 319KB （降 31.2%，耗时 2098ms）
     语法校验                                         通过（node --check，按 CJS 解析）
   axios@1.6.0/axios.js                           2.5KB -> 1.8KB （降 29.7%，耗时 0ms）
     语法校验                                         通过（node --check，按 ESM 解析）
 
-[1m7. 代码压缩 + 传输压缩 叠加[0m
+7. 代码压缩 + 传输压缩 叠加
 ────────────────────────────────────────────────────────────────────────
   vue@3.3.4/dist/vue.global.js                   463KB（原始）
     -> 仅代码压缩后                                    319KB（降 31.2%）
     -> 代码压缩 + gzip                               85.0KB（降 81.6%）
     -> 代码压缩 + brotli                             80.7KB（降 82.6%）
 
-[1m8. HTTP 层（真实请求）[0m
+8. HTTP 层（真实请求）
 ────────────────────────────────────────────────────────────────────────
-  GET（原始，无压缩）                                    7.9ms · 297KB
-  GET（内存缓存命中）                                    1.9ms
-  GET（gzip，含首次压缩）                                6.6ms · 69.9KB
-  GET（gzip，压缩结果命中缓存）                             1.4ms
-  GET（If-None-Match -> 304）                      1.2ms · 状态 304
-  GET（Range: bytes=0-1023）                       1.5ms · 状态 206 · 1024 字节
+  GET（原始，无压缩）                                    7.6ms · 297KB
+  GET（内存缓存命中）                                    1.6ms
+  GET（gzip，含首次压缩）                                7.5ms · 69.9KB
+  GET（gzip，压缩结果命中缓存）                             1.5ms
+  GET（If-None-Match -> 304）                      1.1ms · 状态 304
+  GET（Range: bytes=0-1023）                       1.7ms · 状态 206 · 1024 字节
   原始文件大小                                         297KB
 
-[1m9. 打包（?bundle）[0m
+9. 打包（?bundle）
 ────────────────────────────────────────────────────────────────────────
   模式一：Inline —— 只合并包内相对依赖                        
     express@4.18.2/lib/express.js?bundle         状态 200 · 模式 inline-cjs · 模块数 11
@@ -76,10 +76,10 @@ Node v22.22.2 · 上游 https://registry.npmjs.org（来源 default）
     ?bundle&min + gzip 传输                        13.0KB
                                                  
   模式二：Rewrite —— ESM 说明符重写为绝对 URL                
-    axios@1.6.0/lib/axios.js?esm                 模式 rewrite · 3.0KB
-      import utils from '/npm/axios@1.6.0/lib/utils.js'; 
-      import bind from '/npm/axios@1.6.0/lib/helpers/bind.js'; 
-      import Axios from '/npm/axios@1.6.0/lib/core/Axios.js'; 
+    axios@1.6.0/lib/axios.js?esm                 模式 rewrite · 3.8KB
+      import utils from '/npm/axios@1.6.0/lib/utils.js?esm'; 
+      import bind from '/npm/axios@1.6.0/lib/helpers/bind.js?esm'; 
+      import Axios from '/npm/axios@1.6.0/lib/core/Axios.js?esm'; 
                                                  
   模式三：Deep Inline —— 递归内联外部依赖（真正的「多包合并成单文件」）     
     express@4.18.2/lib/express.js?bundle=deep    状态 200 · 模式 deep-inline-cjs
@@ -87,24 +87,24 @@ Node v22.22.2 · 上游 https://registry.npmjs.org（来源 default）
       涉及包数                                       70
       仍未内联的说明符                                   50 个（全部是 Node 内置模块）
       产物体积                                       928KB
-      打包耗时                                       冷缓存 9707ms（含 70 个包的下载解包） -> 热缓存 86ms
+      打包耗时                                       冷缓存 22336ms（含 70 个包的下载解包） -> 热缓存 70ms
       深度打包 + 代码压缩 + gzip                         246KB
       在 Node 中真实 require 并起服务                    typeof express=function | GET /hello -> 200 {"ok":true,"from":"single-file-express"}
     cookie-parser@1.4.6 对照                       普通 1 包 / 5.3KB  ->  深度 3 包 / 10.7KB
 
-[1m10. 监控与运维接口[0m
+10. 监控与运维接口
 ────────────────────────────────────────────────────────────────────────
   GET /_metrics（Prometheus 文本格式）                 1.1ms · 3.7KB
     导出的指标样本数                                     54
     指标名                                          byr_cache_misses_total, byr_upstream_requests_total, byr_extractions_total, byr_extracted_bytes_total, byr_extracted_files_total, byr_cache_hits_total, byr_http_requests_total, byr_http_bytes_sent_total, byr_compression_bytes_saved_total, byr_minify_bytes_saved_total, byr_extraction_duration_seconds, byr_http_request_duration_seconds, process_uptime_seconds, process_resident_memory_bytes, nodejs_heap_used_bytes, byr_event_loop_lag_seconds
-  GET /_api/vue@3.3.4/tree                       7.2ms · 38 个文件 · 6.8KB
-  GET /_api/vue@3.3.4/dir/dist                   1.1ms · 14 个文件
+  GET /_api/vue@3.3.4/tree                       6.7ms · 38 个文件 · 6.8KB
+  GET /_api/vue@3.3.4/dir/dist                   1.0ms · 14 个文件
 
-[1m11. 并发解包信号量与限流[0m
+11. 并发解包信号量与限流
 ────────────────────────────────────────────────────────────────────────
   解包信号量上限（MAX_CONCURRENT_EXTRACT）                4
   内存缓存命中率                                        48.4%（271 个条目 / 3.2MB）
-  5 个不同冷包同时请求                                    448ms · 峰值并发 4（上限 4）· 累计完成 86 次
+  5 个不同冷包同时请求                                    645ms · 峰值并发 3（上限 4）· 累计完成 82 次
   限流开启（60/分钟，突发容量 5）                             第 6 个请求被拒 · Retry-After 1s · 累计拒绝 1 次
   限流关闭后                                          状态 200（恢复正常放行）
 

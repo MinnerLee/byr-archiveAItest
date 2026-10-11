@@ -1,0 +1,197 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>BYR Archive 浏览器端真实验证</title>
+<style>
+  body { font: 14px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 860px; margin: 0 auto; padding: 28px 20px; color: #1f2328; }
+  h1 { font-size: 20px; }
+  p.sub { color: #6e7781; margin-top: 0; }
+  ul { list-style: none; padding: 0; }
+  li { padding: 6px 0; border-top: 1px solid #eaeef2; display: flex; gap: 10px; align-items: baseline; }
+  code { background: #f6f8fa; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  .ok { color: #1a7f37; font-weight: 600; }
+  .bad { color: #cf222e; font-weight: 600; }
+  .wait { color: #9a6700; }
+  .detail { color: #6e7781; font-size: 12px; margin-left: auto; }
+  #summary { margin-top: 20px; padding: 10px 12px; border-radius: 6px; background: #f6f8fa; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>BYR Archive · 浏览器端真实验证</h1>
+<p class="sub">
+  本页通过 <code>&lt;script src&gt;</code> / <code>&lt;link&gt;</code> / <code>fetch()</code> 从
+  <strong>BYR Archive 服务</strong>加载 npm 包内容，用来验证「服务在真实浏览器里是否可用」。
+  这正是 jsDelivr 的核心使用场景：跨域直接引入。
+</p>
+<ul id="result"></ul>
+<div id="summary" class="wait">检测中…</div>
+
+<!-- ============================================================
+     下面这些就是「真实用法」：和用 jsDelivr 时写的完全一样，
+     只是把 cdn.jsdelivr.net 换成了本服务的地址。
+     ============================================================ -->
+
+<!-- 1) 入口文件：/vue@3.3.4 → 命中 jsdelivr 字段 → dist/vue.global.js（UMD，挂 window.Vue） -->
+<script src="http://127.0.0.1:18080/vue@3.3.4"></script>
+
+<!-- 2) 入口文件：/lodash → 命中 main → lodash.js（挂 window._） -->
+<script src="http://127.0.0.1:18080/lodash"></script>
+
+<!-- 3) jsDelivr 兼容前缀写法 -->
+<script src="http://127.0.0.1:18080/npm/dayjs@1.11.10/dayjs.min.js"></script>
+
+<script>
+  // 服务地址（与上面 script 标签里的 host 保持一致）
+  const BASE = 'http://127.0.0.1:18080';
+  const results = [];
+
+  function report(name, ok, detail) {
+    results.push({ name, ok, detail });
+    const li = document.createElement('li');
+    li.innerHTML =
+      `<span class="${ok ? 'ok' : 'bad'}">${ok ? '✓' : '✗'}</span>` +
+      `<span>${name}</span>` +
+      `<span class="detail">${detail || ''}</span>`;
+    document.getElementById('result').appendChild(li);
+  }
+
+  // 捕获「资源加载失败」与「未捕获异常」——
+  // 这两类问题不会进到下面的 try/catch 里，但恰恰是最致命的情况
+  // （例如某个 <script src> 返回 404 或 CORS 被拒）。
+  window.addEventListener('error', (e) => {
+    if (e.target && (e.target.tagName === 'SCRIPT' || e.target.tagName === 'LINK')) {
+      report(`资源加载失败：${e.target.tagName} ${e.target.src || e.target.href}`, false, '加载过程中出错');
+    } else if (e.message) {
+      report(`未捕获异常：${e.message}`, false, `${e.filename || ''}:${e.lineno || ''}`);
+    }
+  }, true);
+  window.addEventListener('unhandledrejection', (e) => {
+    report(`未处理的 Promise 拒绝：${e.reason}`, false, '');
+  });
+
+  async function run() {
+    // 1. Vue：入口文件按 jsdelivr 字段解析到 UMD 构建，应挂上 window.Vue
+    report('&lt;script src="/vue@3.3.4"&gt; 加载入口文件（jsdelivr 规则）',
+      typeof window.Vue === 'object' && typeof window.Vue.createApp === 'function',
+      `window.Vue = ${typeof window.Vue}，createApp = ${typeof window.Vue?.createApp}，version = ${window.Vue?.version}`);
+
+    // 2. Lodash：入口文件按 main 字段解析
+    report('&lt;script src="/lodash"&gt; 加载入口文件（main 规则）',
+      typeof window._ === 'function' && /^\d+\.\d+\.\d+/.test(window._?.VERSION || ''),
+      `window._ = ${typeof window._}，VERSION = ${window._?.VERSION}（不硬编码版本号，latest 会变）`);
+
+    // 3. jsDelivr 兼容前缀
+    report('&lt;script src="/npm/dayjs@1.11.10/dayjs.min.js"&gt; 兼容前缀',
+      typeof window.dayjs === 'function',
+      `window.dayjs = ${typeof window.dayjs}`);
+
+    // 4. 跨域 fetch JSON（验证 CORS 头对浏览器真的生效）
+    try {
+      const res = await fetch(`${BASE}/vue@3.3.4/package.json`);
+      const pkg = await res.json();
+      report('跨域 fetch() 获取 JSON（CORS）', res.ok && pkg.name === 'vue',
+        `HTTP ${res.status}，content-type = ${res.headers.get('content-type')}，name = ${pkg.name}`);
+    } catch (err) {
+      report('跨域 fetch() 获取 JSON（CORS）', false, `失败：${err.message}`);
+    }
+
+    // 5. 用本服务提供的资源真正跑一段业务逻辑（不是只看变量存在）
+    try {
+      const app = window.Vue.createApp({ template: '<p id="mounted">{{ msg }}</p>', data: () => ({ msg: 'Vue 3 由 BYR Archive 提供' }) });
+      const host = document.createElement('div');
+      document.body.appendChild(host);
+      app.mount(host);
+      const text = host.querySelector('#mounted')?.textContent || '';
+      report('用加载到的 Vue 真实挂载一个组件',
+        text.includes('BYR Archive'),
+        `渲染结果："${text}"`);
+    } catch (err) {
+      report('用加载到的 Vue 真实挂载一个组件', false, `失败：${err.message}`);
+    }
+
+    // 6. 用加载到的 lodash 真实做一次计算
+    try {
+      const out = window._.chunk([1, 2, 3, 4, 5], 2);
+      report('用加载到的 lodash 真实计算',
+        JSON.stringify(out) === '[[1,2],[3,4],[5]]',
+        `_.chunk([1,2,3,4,5], 2) = ${JSON.stringify(out)}`);
+    } catch (err) {
+      report('用加载到的 lodash 真实计算', false, `失败：${err.message}`);
+    }
+
+    // 7. 用 dayjs 真实格式化一次时间
+    try {
+      const s = window.dayjs('2026-10-11').format('YYYY/MM/DD');
+      report('用加载到的 dayjs 真实格式化', s === '2026/10/11', `结果 = ${s}`);
+    } catch (err) {
+      report('用加载到的 dayjs 真实格式化', false, `失败：${err.message}`);
+    }
+
+    // 8. 服务端即时压缩 + 浏览器解压 —— 验证 ?min 与 gzip/brotli 链路
+    try {
+      const res = await fetch(`${BASE}/lodash@4.17.21/lodash.js?min`);
+      const code = await res.text();
+      report('fetch() 获取服务端压缩后的代码（?min + 内容编码协商）',
+        res.ok && code.length > 10000 && !code.includes('/*!'),
+        `HTTP ${res.status}，长度 ${code.length} 字节，未含版权注释块（说明压缩生效）`);
+    } catch (err) {
+      report('fetch() 获取服务端压缩后的代码', false, `失败：${err.message}`);
+    }
+
+    // 9. 显式验证「传递式重写」：重写出的 URL 必须带 ?esm，
+    //    否则浏览器加载第二层时拿到的还是原始文件，裸说明符会解析失败。
+    try {
+      const res = await fetch(`${BASE}/nanoid@5.0.4/index.browser.js?esm`);
+      const code = await res.text();
+      const relativeImports = [...code.matchAll(/from\s+['"]([^'"]+)['"]/g)].map((m) => m[1]);
+      const allRewritten = relativeImports.length > 0 && relativeImports.every((u) => u.startsWith('/npm/'));
+      const allTransitive = relativeImports.every((u) => u.includes('?esm'));
+      report('?esm 重写是传递式的（重写出的 URL 带 ?esm）',
+        allRewritten && allTransitive,
+        `重写后的相对导入：${relativeImports.join(' | ') || '(无)'}`);
+    } catch (err) {
+      report('?esm 重写是传递式的（重写出的 URL 带 ?esm）', false, `失败：${err.message}`);
+    }
+
+    // 10. 动态 import() 加载纯 ESM 包的重写产物 —— 端到端跑通模块图
+    //     nanoid 的 index.browser.js 是纯 ESM，且只有一个相对导入，
+    //     整个依赖图都能在浏览器里逐层加载，是 rewrite 模式的理想场景。
+    try {
+      const mod = await import(`${BASE}/nanoid@5.0.4/index.browser.js?esm`);
+      const id = mod.nanoid ? mod.nanoid(12) : null;
+      report('动态 import() 加载纯 ESM 包（nanoid）',
+        typeof mod.nanoid === 'function' && typeof id === 'string' && id.length === 12,
+        `named exports = ${Object.keys(mod).join(', ')}；nanoid(12) = ${id}`);
+    } catch (err) {
+      report('动态 import() 加载纯 ESM 包（nanoid）', false, `失败：${err.message}`);
+    }
+
+    // 11. 反例：CJS 依赖图的 ESM 文件，浏览器加载会失败 —— 这是**已知边界**，
+    //     用一项「预期失败」把边界说清楚，而不是假装它可用。
+    try {
+      await import(`${BASE}/axios@1.6.0/lib/axios.js?esm`);
+      report('已知边界：axios 的 Node ESM 图（依赖 form-data 等 CJS）', true,
+        '竟然加载成功了（若如此，说明边界描述已过时，需更新文档）');
+    } catch (err) {
+      report('已知边界：axios 的 Node ESM 图（依赖 form-data 等 CJS）', true,
+        `按预期失败：${String(err.message).slice(0, 70)}…（重写只做路径替换，不做 CJS→ESM 语义转换）`);
+    }
+
+    const passed = results.filter((r) => r.ok).length;
+    const el = document.getElementById('summary');
+    el.className = passed === results.length ? 'ok' : passed >= results.length - 1 ? 'wait' : 'bad';
+    el.textContent = `浏览器端验证：${passed}/${results.length} 项通过`;
+    // 暴露给自动化工具读取
+    window.__BYR_RESULT__ = { passed, total: results.length, results };
+  }
+
+  // 等所有 <script> 执行完
+  window.addEventListener('load', () => {
+    run().catch((err) => {
+      document.getElementById('summary').textContent = `脚本异常：${err.message}`;
+    });
+  });
+</script>
+</body>
+</html>
