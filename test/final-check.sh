@@ -71,7 +71,7 @@ printf '\033[1mBYR Archive 最终验收\033[0m\n'
 printf '项目目录 %s\n' "$ROOT"
 printf 'Node     %s\n' "$NODE_BIN"
 printf 'Chrome   %s\n' "${CHROME_BIN:-（未找到，将跳过浏览器层）}"
-printf '浏览器路径 %s\n' "$(command -v cygpath >/dev/null 2>&1 && cygpath -m "$ROOT" || printf '%s' "$ROOT")"
+printf '浏览器路径 %s\n' "${CHROME_BIN:-（未找到）}"
 printf '地址     %s\n' "$BASE"
 
 SRV_PID=""

@@ -3,22 +3,22 @@ Node v22.22.2 · 上游 https://registry.npmjs.org（来源 default）
 
 1. 上游请求策略：精确版本 vs packument
 ────────────────────────────────────────────────────────────────────────
-  GET /vue/3.3.4（单版本 manifest）                   2.9KB · 211ms
-  GET /vue（简版 packument）                         866KB · 168ms
-  GET /vue（完整 packument）                         2.0MB · 146ms
+  GET /vue/3.3.4（单版本 manifest）                   2.9KB · 384ms
+  GET /vue（简版 packument）                         866KB · 166ms
+  GET /vue（完整 packument）                         2.0MB · 127ms
   -> 精确版本路径相比完整 packument 节省                     99.9%（2.0MB）
   -> 简版 packument 相比完整 packument 节省              58.1%
 
 2. 下载 + 解包（冷路径）
 ────────────────────────────────────────────────────────────────────────
-  lodash@4.17.21                                 1054 个文件 · 1.3MB · 659ms
-  vue@3.3.4                                      38 个文件 · 1.9MB · 170ms
-  axios@1.6.0                                    80 个文件 · 1.7MB · 191ms
+  lodash@4.17.21                                 1054 个文件 · 1.3MB · 822ms
+  vue@3.3.4                                      38 个文件 · 1.9MB · 171ms
+  axios@1.6.0                                    80 个文件 · 1.7MB · 359ms
 
 3. 缓存效果（热路径，同一进程）
 ────────────────────────────────────────────────────────────────────────
-  vue@3.3.4 二次加载（命中磁盘缓存）                         0.9ms
-  首次读取文件（磁盘）                                     0.51ms
+  vue@3.3.4 二次加载（命中磁盘缓存）                         1.0ms
+  首次读取文件（磁盘）                                     0.45ms
   再次读取文件（内存 LRU）                                 0.04ms
 
 4. registry 元信息请求合并（single-flight）
@@ -36,7 +36,7 @@ Node v22.22.2 · 上游 https://registry.npmjs.org（来源 default）
 ────────────────────────────────────────────────────────────────────────
   lodash@4.17.21/lodash.js                       531KB -> 146KB （降 72.5%，耗时 543ms）
     语法校验                                         通过（node --check，按 CJS 解析）
-  vue@3.3.4/vue.global.js                        463KB -> 319KB （降 31.2%，耗时 2072ms）
+  vue@3.3.4/vue.global.js                        463KB -> 319KB （降 31.2%，耗时 1866ms）
     语法校验                                         通过（node --check，按 CJS 解析）
   axios@1.6.0/axios.js                           2.5KB -> 1.8KB （降 29.7%，耗时 0ms）
     语法校验                                         通过（node --check，按 ESM 解析）
@@ -50,12 +50,12 @@ Node v22.22.2 · 上游 https://registry.npmjs.org（来源 default）
 
 8. HTTP 层（真实请求）
 ────────────────────────────────────────────────────────────────────────
-  GET（原始，无压缩）                                    8.3ms · 297KB
-  GET（内存缓存命中）                                    2.2ms
-  GET（gzip，含首次压缩）                                7.9ms · 69.9KB
+  GET（原始，无压缩）                                    8.0ms · 297KB
+  GET（内存缓存命中）                                    1.9ms
+  GET（gzip，含首次压缩）                                8.3ms · 69.9KB
   GET（gzip，压缩结果命中缓存）                             1.1ms
-  GET（If-None-Match -> 304）                      1.1ms · 状态 304
-  GET（Range: bytes=0-1023）                       1.7ms · 状态 206 · 1024 字节
+  GET（If-None-Match -> 304）                      1.4ms · 状态 304
+  GET（Range: bytes=0-1023）                       1.0ms · 状态 206 · 1024 字节
   原始文件大小                                         297KB
 
 9. 打包（?bundle）
@@ -73,7 +73,7 @@ Node v22.22.2 · 上游 https://registry.npmjs.org（来源 default）
       打包产物体积                                     39.7KB
       在 Node 中 require 产物并实际调用                   getType(.js)=application/javascript | getExtension(application/json)=json | 已注册类型数=1173
     ?bundle&min 产物体积                             46.8KB（x-byr-minified: true）
-    ?bundle&min + gzip 传输                        13.0KB
+    ?bundle&min + gzip 传输                        13.1KB
                                                  
   模式二：Rewrite —— ESM 说明符重写为绝对 URL                
     axios@1.6.0/lib/axios.js?esm                 模式 rewrite · 3.8KB
@@ -87,24 +87,24 @@ Node v22.22.2 · 上游 https://registry.npmjs.org（来源 default）
       涉及包数                                       70
       仍未内联的说明符                                   50 个（全部是 Node 内置模块）
       产物体积                                       928KB
-      打包耗时                                       冷缓存 9960ms（含 70 个包的下载解包） -> 热缓存 86ms
+      打包耗时                                       冷缓存 24035ms（含 70 个包的下载解包） -> 热缓存 70ms
       深度打包 + 代码压缩 + gzip                         246KB
       在 Node 中真实 require 并起服务                    typeof express=function | GET /hello -> 200 {"ok":true,"from":"single-file-express"}
     cookie-parser@1.4.6 对照                       普通 1 包 / 5.3KB  ->  深度 3 包 / 10.7KB
 
 10. 监控与运维接口
 ────────────────────────────────────────────────────────────────────────
-  GET /_metrics（Prometheus 文本格式）                 1.4ms · 3.7KB
+  GET /_metrics（Prometheus 文本格式）                 1.3ms · 3.7KB
     导出的指标样本数                                     54
     指标名                                          byr_cache_misses_total, byr_upstream_requests_total, byr_extractions_total, byr_extracted_bytes_total, byr_extracted_files_total, byr_cache_hits_total, byr_http_requests_total, byr_http_bytes_sent_total, byr_compression_bytes_saved_total, byr_minify_bytes_saved_total, byr_extraction_duration_seconds, byr_http_request_duration_seconds, process_uptime_seconds, process_resident_memory_bytes, nodejs_heap_used_bytes, byr_event_loop_lag_seconds
-  GET /_api/vue@3.3.4/tree                       7.9ms · 38 个文件 · 6.8KB
-  GET /_api/vue@3.3.4/dir/dist                   1.1ms · 14 个文件
+  GET /_api/vue@3.3.4/tree                       7.3ms · 38 个文件 · 6.8KB
+  GET /_api/vue@3.3.4/dir/dist                   1.6ms · 14 个文件
 
 11. 并发解包信号量与限流
 ────────────────────────────────────────────────────────────────────────
   解包信号量上限（MAX_CONCURRENT_EXTRACT）                4
   内存缓存命中率                                        48.4%（271 个条目 / 3.2MB）
-  5 个不同冷包同时请求                                    491ms · 峰值并发 4（上限 4）· 累计完成 82 次
+  5 个不同冷包同时请求                                    704ms · 峰值并发 3（上限 4）· 累计完成 82 次
   限流开启（60/分钟，突发容量 5）                             第 6 个请求被拒 · Retry-After 1s · 累计拒绝 1 次
   限流关闭后                                          状态 200（恢复正常放行）
 
