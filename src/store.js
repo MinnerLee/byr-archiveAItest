@@ -21,6 +21,20 @@ import * as tar from './tar.js';
 import entryResolver from './entry.js';
 import { upstreamError, notFound, tooLarge, badRequest } from './errors.js';
 import { shortHash } from './util.js';
+import { createSemaphore } from './semaphore.js';
+import { metrics } from './metrics.js';
+
+/**
+ * 全局解包信号量。
+ *
+ * 这是 config 里 `MAX_CONCURRENT_EXTRACT` 真正生效的地方 ——
+ * 之前这个配置项只是被声明、从未被使用（一个「空承诺」），现在补上。
+ * 它把「同时进行的下载 + 解包」限制在一个固定并发度内：
+ * 超出的请求排队等待，而不是一起抢事件循环和磁盘。
+ */
+const extractSemaphore = createSemaphore(config.maxConcurrentExtract, {
+  maxQueue: config.maxExtractQueue,
+});
 
 /**
  * @typedef {object} MaterializedPackage
@@ -31,6 +45,7 @@ import { shortHash } from './util.js';
  * @property {Map<string, number>} fileIndex 包内相对路径 → 大小
  * @property {Set<string>} dirIndex 包内目录集合（不含空目录）
  * @property {number} totalBytes
+ * @property {number} storedAt 解包落盘时间戳（用于 Last-Modified）
  * @property {string} how 版本解析方式
  */
 
@@ -74,35 +89,60 @@ async function materialize(name, version, tarballUrl) {
   const cached = await cache.getExtracted(name, version);
   if (cached) {
     logger.debug(`解包结果命中磁盘缓存: ${name}@${version}`);
-    return { dir: cached.dir, files: cached.files, totalBytes: cached.totalBytes };
+    metrics.cacheAccess('extracted', true);
+    return {
+      dir: cached.dir,
+      files: cached.files,
+      totalBytes: cached.totalBytes,
+      // 解包时间：作为该版本文件的 Last-Modified 依据（见 handler 的说明）
+      storedAt: cached.storedAt,
+    };
   }
+  metrics.cacheAccess('extracted', false);
 
   logger.info(`下载并解包 ${name}@${version} ← ${tarballUrl}`);
 
-  return cache.extractInto(name, version, async (dir) => {
-    const { stream, contentLength } = await registry.openTarball(tarballUrl, config.maxTarballBytes);
-    if (contentLength) logger.debug(`tarball 体积 ${contentLength} 字节`);
+  const startedAt = Date.now();
+  // 整段「下载 + 解包」都在信号量保护下，避免并发冷包把 CPU 与磁盘打满
+  try {
+    const result = await extractSemaphore.run(() =>
+      cache.extractInto(name, version, async (dir) => {
+        const { stream, contentLength } = await registry.openTarball(tarballUrl, config.maxTarballBytes);
+        if (contentLength) logger.debug(`tarball 体积 ${contentLength} 字节`);
 
-    const result = await tar.extractTgz(stream, dir, {
-      // npm 官方 registry 的条目统一以 `package/` 开头
-      stripPrefix: 'package/',
-      maxTotalBytes: config.maxTarballBytes * 8,
-      maxFileBytes: config.maxFileBytes,
-    });
+        const unpacked = await tar.extractTgz(stream, dir, {
+          // npm 官方 registry 的条目统一以 `package/` 开头
+          stripPrefix: 'package/',
+          maxTotalBytes: config.maxTarballBytes * 8,
+          maxFileBytes: config.maxFileBytes,
+        });
 
-    await flattenWrapperDir(dir);
+        await flattenWrapperDir(dir);
 
-    // 拍平后文件清单可能变了，重新扫描一次磁盘，保证索引与磁盘一致
-    const files = await scanFiles(dir);
-    const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+        // 拍平后文件清单可能变了，重新扫描一次磁盘，保证索引与磁盘一致
+        const files = await scanFiles(dir);
+        const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
 
-    logger.info(
-      `解包完成 ${name}@${version}: ${files.length} 个文件，共 ${totalBytes} 字节` +
-        (result.skipped ? `（跳过 ${result.skipped} 个非普通文件条目）` : ''),
+        logger.info(
+          `解包完成 ${name}@${version}: ${files.length} 个文件，共 ${totalBytes} 字节` +
+            (unpacked.skipped ? `（跳过 ${unpacked.skipped} 个非普通文件条目）` : ''),
+        );
+
+        return { files, totalBytes };
+      }),
     );
 
-    return { files, totalBytes };
-  });
+    metrics.extraction({
+      ms: Date.now() - startedAt,
+      bytes: result.totalBytes,
+      files: result.files.length,
+      ok: true,
+    });
+    return result;
+  } catch (err) {
+    metrics.extraction({ ms: Date.now() - startedAt, bytes: 0, files: 0, ok: false });
+    throw err;
+  }
 }
 
 /** 递归扫描目录，产出「相对路径 + 大小」清单。 */
@@ -172,6 +212,7 @@ export async function loadPackage(name, versionSpec) {
     candidates,
     dir: materialized.dir,
     totalBytes: materialized.totalBytes,
+    storedAt: materialized.storedAt || Date.now(),
     fileIndex: new Map(materialized.files.map((f) => [f.path, f.size])),
     dirIndex: buildDirIndex(materialized.files),
     files: materialized.files,
@@ -261,19 +302,55 @@ export function listDir(pkg, relPath) {
  * 解析入口文件（题目要求的优先级链）。
  *
  * @param {MaterializedPackage} pkg
+ * @param {object} [options]
+ * @param {boolean} [options.nodeDefault] 4 条规则全落空时是否回退到 Node 默认解析（包根 index.js）。
+ *        HTTP 路径默认不启用（题面规则 4 要求 404）；打包器解析依赖包时会启用。
  * @returns {{path:string, source:string}}
  */
-export function resolveEntry(pkg) {
-  const entry = entryResolver.resolveEntry(pkg.manifest, (relPath) => pkg.fileIndex.has(relPath));
+export function resolveEntry(pkg, options = {}) {
+  const nodeDefault = options.nodeDefault ?? config.entryNodeDefault;
+
+  const entry = entryResolver.resolveEntry(
+    pkg.manifest,
+    (relPath) => pkg.fileIndex.has(relPath),
+    { ...options, nodeDefault },
+  );
 
   if (!entry) {
+    // 如果包里其实存在 index.js，说明这个包依赖 Node 的默认解析。
+    // 直接给 404 会让人一头雾水，所以把原因和解决办法一并写进响应体。
+    const nodeCandidate = ['index.js', 'index.mjs', 'index.cjs', 'index.json'].find((f) =>
+      pkg.fileIndex.has(f),
+    );
+
     throw notFound(
       `包 ${pkg.name}@${pkg.version} 没有可用的入口文件（jsdelivr / exports["."] / main 均未命中）`,
-      { package: pkg.name, version: pkg.version },
+      {
+        package: pkg.name,
+        version: pkg.version,
+        ...(nodeCandidate
+          ? {
+              hint:
+                `该包的 package.json 未声明 main / exports，但包含 ${nodeCandidate}。` +
+                'Node 会默认解析到它；本服务默认严格遵循题面规则返回 404。' +
+                '设置 ENTRY_NODE_DEFAULT=1 可启用 Node 默认解析回退。',
+              nodeDefaultCandidate: nodeCandidate,
+              enableWith: `直接访问文件 /${pkg.name}@${pkg.version}/${nodeCandidate}`,
+            }
+          : {}),
+      },
     );
   }
 
   return entry;
+}
+
+/**
+ * 解包信号量的运行状态（供 /_metrics 与 /_stats 使用）。
+ * @returns {{active:number,queued:number,limit:number,peakActive:number,completed:number,waitedMs:number}}
+ */
+export function extractStats() {
+  return extractSemaphore.stats();
 }
 
 /** 缓存键工具，供上层构造稳定的 ETag。 */
@@ -288,4 +365,5 @@ export default {
   listDir,
   resolveEntry,
   contentEtag,
+  extractStats,
 };

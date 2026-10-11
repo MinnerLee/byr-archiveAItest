@@ -99,18 +99,39 @@ ${rows.join('\n')}
 /**
  * 服务首页。放一点使用说明，方便人工验证。
  */
-export function renderServiceIndex({ registry, port }) {
+export function renderServiceIndex({ registry, port, registrySource }) {
   const examples = [
-    ['/lodash', '返回 lodash 最新版本的入口文件'],
+    ['/lodash', '返回 lodash 最新版本的入口文件（命中 main 字段）'],
     ['/vue@3.3.4/', 'vue@3.3.4 的根目录列表'],
-    ['/vue@3.3.4/dist/vue.js', '返回指定文件'],
-    ['/react', 'jsdelivr / exports["."].default / main 优先级解析入口'],
-    ['/vue@^3.2.0/package.json', 'semver 范围解析到满足条件的最高版本'],
+    ['/vue@3.3.4/dist/vue.runtime.esm-browser.js', '返回指定文件'],
+    ['/react', '命中 exports["."].default'],
+    ['/vue@3.3.4', '命中 jsdelivr 字段'],
+    ['/vue@%5E3.2.0/package.json', 'semver 范围解析到满足条件的最高版本'],
     ['/vue@beta/package.json', 'dist-tag 解析'],
-    ['/lodash@4.17.21/lodash.min.js?min', '按需压缩'],
+    ['/lodash@4.17.21/lodash.js?min', '服务端即时压缩'],
+    ['/mime@3.0.0/index.js?bundle', '打包：内联包内相对依赖'],
+    ['/express@4.18.2/lib/express.js?bundle=deep', '深度打包：递归内联 70 个外部依赖'],
+    ['/axios@1.6.0/lib/axios.js?esm', '重写 import 说明符为绝对 URL'],
   ];
 
   const rows = examples
+    .map(
+      ([path, desc]) =>
+        `<tr><td><a href="${escapeHtml(path)}">${escapeHtml(path)}</a></td><td>${escapeHtml(desc)}</td></tr>`,
+    )
+    .join('\n');
+
+  const endpoints = [
+    ['/_health', '健康检查'],
+    ['/_stats', '缓存 / 解包信号量 / 限流 / 指标快照'],
+    ['/_metrics', 'Prometheus 文本格式指标'],
+    ['/_api/vue@3.3.4', '包信息 JSON'],
+    ['/_api/vue@3.3.4/tree', '完整文件树 JSON'],
+    ['/_api/vue@3.3.4/dir/dist', '目录 JSON'],
+    ['/_api/vue@3.3.4/file/dist/vue.global.js', '单文件元信息 JSON'],
+  ];
+
+  const endpointRows = endpoints
     .map(
       ([path, desc]) =>
         `<tr><td><a href="${escapeHtml(path)}">${escapeHtml(path)}</a></td><td>${escapeHtml(desc)}</td></tr>`,
@@ -124,31 +145,34 @@ export function renderServiceIndex({ registry, port }) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>BYR Archive</title>
 <style>
-  body { font: 14px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 820px; margin: 0 auto; padding: 32px 20px; color: #1f2328; }
+  body { font: 14px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 860px; margin: 0 auto; padding: 32px 20px; color: #1f2328; }
   h1 { font-size: 22px; margin-bottom: 4px; }
   p.sub { color: #6e7781; margin-top: 0; }
   code { background: #f6f8fa; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
   table { border-collapse: collapse; width: 100%; margin-top: 12px; }
   td { border-top: 1px solid #eaeef2; padding: 7px 4px; vertical-align: top; }
-  td:first-child { width: 46%; }
+  td:first-child { width: 52%; }
   a { color: #0969da; text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .kv { margin-top: 20px; font-size: 13px; color: #57606a; }
+  .kv { margin-top: 22px; font-size: 13px; color: #57606a; }
+  h3 { margin-top: 26px; margin-bottom: 0; }
 </style>
 </head>
 <body>
 <h1>BYR Archive</h1>
-<p class="sub">最简版 jsDelivr —— 直接从 npm registry 拉取包并按 URL 提供文件服务</p>
+<p class="sub">最简版 jsDelivr —— 直接从 npm registry 拉取包并按 URL 提供文件服务（零运行时依赖）</p>
 <hr>
 <h3>试试这些地址</h3>
 <table>
 ${rows}
 </table>
+<h3>接口</h3>
+<table>
+${endpointRows}
+</table>
 <div class="kv">
-  上游 registry：<code>${escapeHtml(registry)}</code> ·
-  本地端口：<code>${port}</code> ·
-  <a href="/_health">/_health</a> ·
-  <a href="/_stats">/_stats</a>
+  上游 registry：<code>${escapeHtml(registry)}</code>（来源：${escapeHtml(registrySource || 'default')}）·
+  本地端口：<code>${port}</code>
 </div>
 </body>
 </html>

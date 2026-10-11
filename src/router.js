@@ -31,13 +31,72 @@ const PLAIN_RE = /^([^/@\s]+)(?:@([^/]+))?(\/.*)?$/;
 
 /**
  * @typedef {object} Route
- * @property {'index'|'health'|'stats'|'entry'|'listing'|'file'|'not-found'} kind
+ * @property {'index'|'health'|'stats'|'metrics'|'api'|'entry'|'listing'|'file'|'not-found'} kind
  * @property {string} [name] 包名
  * @property {string} [versionSpec] URL 中的版本描述，空串表示未指定
  * @property {string} [subPath] 包内相对路径（不含前导斜杠）
+ * @property {'info'|'tree'|'dir'|'file'} [api] /_api/ 的子命令
  * @property {boolean} [compat] 是否使用了 /npm/ 兼容前缀
  * @property {object} [query] 查询参数
  */
+
+/** 子命令集合：`/_api/{pkg}@{ver}/{子命令}/...` */
+const API_SUBCOMMANDS = new Set(['tree', 'dir', 'file']);
+
+/**
+ * 解析 `/_api/...` 系列接口。
+ *
+ * 形态：
+ *   /_api/{包名}[@{版本}]                  概览
+ *   /_api/{包名}[@{版本}]/tree             文件树
+ *   /_api/{包名}[@{版本}]/dir[/子目录]      目录 JSON
+ *   /_api/{包名}[@{版本}]/file/{文件路径}   文件元信息
+ *
+ * 之所以先解析包名再看第一段是不是子命令，是因为 `tree` / `dir` / `file`
+ * 都可能是合法文件名或目录名 —— 靠「保留字」而不是「位置约定」会更容易出错。
+ *
+ * @param {string} rest 已经去掉 `/_api/` 前缀的部分
+ * @param {object} query
+ */
+function parseApiRoute(rest, query) {
+  const trimmed = rest.replace(/^\/+/, '');
+  if (trimmed === '') {
+    throw badRequest('缺少包名，用法：/_api/{包名}[@{版本}][/tree|/dir|/file/{路径}]');
+  }
+
+  const scoped = SCOPED_RE.exec(trimmed);
+  const plain = scoped ? null : PLAIN_RE.exec(trimmed);
+  const match = scoped || plain;
+  if (!match) {
+    throw badRequest(`无法从 /_api/ 后解析出包名: ${rest}`);
+  }
+
+  const name = match[1];
+  const versionSpec = (match[2] ?? '').trim();
+  const segments = (match[3] ?? '').split('/').filter((s) => s !== '');
+
+  const first = segments[0] ?? '';
+
+  if (first === '') {
+    return { kind: 'api', api: 'info', name, versionSpec, subPath: '', query };
+  }
+
+  if (!API_SUBCOMMANDS.has(first)) {
+    throw badRequest(
+      `/_api/ 下不认识的子命令: ${first}（可用：tree、dir、file）` +
+        `；若想取文件内容请用 /_api/{包}@{版本}/file/${segments.join('/')}`,
+    );
+  }
+
+  return {
+    kind: 'api',
+    api: first,
+    name,
+    versionSpec,
+    subPath: segments.slice(1).join('/'),
+    query,
+  };
+}
 
 /**
  * 解析请求 URL。
@@ -65,6 +124,12 @@ export function parseRoute(rawUrl, base) {
   }
   if (pathname === '/_stats') {
     return { kind: 'stats', query };
+  }
+  if (pathname === '/_metrics') {
+    return { kind: 'metrics', query };
+  }
+  if (pathname === '/_api' || pathname.startsWith('/_api/')) {
+    return parseApiRoute(pathname.slice('/_api'.length), query);
   }
   if (pathname === '/favicon.ico') {
     return { kind: 'not-found', query };

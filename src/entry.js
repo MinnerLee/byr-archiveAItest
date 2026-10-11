@@ -44,9 +44,18 @@ export function normalizeEntryPath(input) {
  *
  * @param {object} manifest package.json 的内容（或 registry 返回的单版本 manifest）
  * @param {(relPath:string) => boolean} exists 判断包内某路径是否为存在的文件
+ * @param {object} [options]
+ * @param {boolean} [options.nodeDefault=false] 4 条规则全部落空时，
+ *        是否再尝试 Node 的默认解析（包根 `index.js` 等）。
+ *
+ *        默认 **关闭**，因为题面规则 4 明确写着「以上均不满足则返回 404」。
+ *        但真实世界里有包确实不写 `main`（例如 `mime@3.0.0`），
+ *        靠 Node 的 `index.js` 默认解析工作 —— 所以打包器在解析**依赖包**的入口时
+ *        会显式打开这个开关（它模拟的是 Node 的解析语义，不是本服务的 URL 语义）。
+ *
  * @returns {{path:string, source:string}|null} 解析结果；无法解析返回 null
  */
-export function resolveEntry(manifest, exists) {
+export function resolveEntry(manifest, exists, options = {}) {
   if (!manifest || typeof manifest !== 'object') return null;
 
   /** 用目录兜底把候选路径变成「确实存在的文件路径」。 */
@@ -81,8 +90,6 @@ export function resolveEntry(manifest, exists) {
       const settled = settle(normalizeEntryPath(def));
       if (settled) return { path: settled, source: 'exports["."].default' };
     }
-    // 2.a' 嵌套条件里再找 default（例：exports["."].import.default）
-    //      题面没要求，仅在未指定 main 时作为兜底，见下方 enhanced 分支
   }
 
   // ---- 规则 3：main ----
@@ -101,6 +108,13 @@ export function resolveEntry(manifest, exists) {
     if (typeof browser === 'string') {
       const settled = settle(normalizeEntryPath(browser));
       if (settled) return { path: settled, source: 'browser' };
+    }
+  }
+
+  // ---- 可选增强：Node 默认解析（仅打包器解析依赖时启用） ----
+  if (options.nodeDefault) {
+    for (const index of INDEX_CANDIDATES) {
+      if (exists(index)) return { path: index, source: 'node-default' };
     }
   }
 

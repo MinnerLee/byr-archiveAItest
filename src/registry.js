@@ -24,6 +24,7 @@ import logger from './logger.js';
 import * as cache from './cache.js';
 import * as semver from './semver.js';
 import { singleFlight, encodePackageName } from './util.js';
+import { metrics } from './metrics.js';
 import { notFound, upstreamError, gatewayTimeout, HttpError } from './errors.js';
 
 /** 简版 packument 的 Accept 值。 */
@@ -37,7 +38,13 @@ function headers(accept) {
     'user-agent': config.userAgent,
     'accept-encoding': 'gzip',
   };
-  if (config.registryToken) out.authorization = `Bearer ${config.registryToken}`;
+  if (config.registryToken) {
+    // `_authToken` 用 Bearer；`~/.npmrc` 里的 `_auth` 是 base64 的 user:pass，必须用 Basic
+    out.authorization =
+      config.registryTokenType === 'basic'
+        ? `Basic ${config.registryToken}`
+        : `Bearer ${config.registryToken}`;
+  }
   return out;
 }
 
@@ -82,23 +89,28 @@ async function upstreamGet(url, options = {}) {
  * @param {string} options.url 请求地址
  * @param {number} options.ttl 缓存时长
  * @param {string} [options.accept]
+ * @param {string} [options.kind] 指标分类：packument / manifest
  * @param {string} options.notFoundMessage 上游 404 时对外暴露的文案
  * @returns {Promise<any>}
  */
-async function getJson({ key, url, ttl, accept, notFoundMessage }) {
+async function getJson({ key, url, ttl, accept, notFoundMessage, kind = 'meta' }) {
   const dedupeKey = `json:${config.registry}|${key}`;
 
   return singleFlight(dedupeKey, async () => {
     const cached = await cache.getMeta(key);
     if (cached && cached.fresh) {
       logger.debug(`meta 命中缓存: ${key}`);
+      metrics.cacheAccess('meta', true);
       return cached.value;
     }
+    metrics.cacheAccess('meta', false);
 
     let response;
     try {
       response = await upstreamGet(url, { accept });
+      metrics.upstreamRequest(kind, true);
     } catch (err) {
+      metrics.upstreamRequest(kind, false);
       // 上游故障时，宁可用过期数据也不要 5xx —— 可用性优先
       if (cached) {
         logger.info(`上游失败，回退到过期缓存 ${key}: ${err.message}`);
@@ -177,6 +189,7 @@ export async function fetchPackument(name) {
         ttl: config.ttl.packument,
         accept: 'application/json',
         notFoundMessage: `未找到包 ${name}`,
+        kind: 'packument',
       });
     }
     throw err;
@@ -206,6 +219,7 @@ export async function fetchManifest(name, version) {
     ttl: config.ttl.manifest,
     accept: 'application/json',
     notFoundMessage: `未找到包 ${name} 的版本 ${version}`,
+    kind: 'manifest',
   });
 }
 
@@ -318,8 +332,10 @@ export async function openTarball(url, maxBytes = config.maxTarballBytes) {
 
   if (!response.ok) {
     clear();
+    metrics.upstreamRequest('tarball', false);
     throw upstreamError(`下载 tarball 失败，上游返回 ${response.status}`, { url });
   }
+  metrics.upstreamRequest('tarball', true);
 
   const length = Number(response.headers.get('content-length') || 0);
   if (length && length > maxBytes) {

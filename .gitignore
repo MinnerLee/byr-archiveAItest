@@ -5,6 +5,9 @@ node_modules/
 .byr-cache/
 .byr-archive/
 
+# 工作区元数据（Agent 工作记忆，与项目代码无关）
+.workbuddy/
+
 # 日志
 *.log
 npm-debug.log*

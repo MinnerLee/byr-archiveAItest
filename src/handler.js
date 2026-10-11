@@ -17,17 +17,58 @@
 import config from './config.js';
 import logger from './logger.js';
 import * as store from './store.js';
+import * as cache from './cache.js';
 import * as mime from './mime.js';
 import * as compress from './compress.js';
 import * as minifyLib from './minify.js';
 import * as bundleLib from './bundle.js';
 import { parseRoute } from './router.js';
 import { renderListing, renderServiceIndex } from './listing.js';
-import { HttpError, notFound, badRequest, tooLarge } from './errors.js';
+import * as api from './api.js';
+import { HttpError, notFound, badRequest } from './errors.js';
 import { shortHash, formatBytes } from './util.js';
 import * as semver from './semver.js';
+import { metrics, renderPrometheus, snapshot as metricsSnapshot } from './metrics.js';
+import { createRateLimiter, clientKey } from './ratelimit.js';
 
-/** 压缩可省略的 MIME 前缀。 */
+/* ------------------------------------------------------------------ */
+/* 限流器                                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 限流器是模块级单例，但可以通过 {@link setRateLimit} 重新配置。
+ *
+ * 为什么要留一个运行时开关而不是只读环境变量？
+ * 因为「默认开启限流」对一个 CDN 来说是不合适的（会误伤正常批量拉取的构建脚本），
+ * 但「限流代码只是摆设、永远不会被执行」又等于没实现。
+ * 所以：默认关闭，但完整实现、可运行时开启、并有自动化测试覆盖。
+ */
+let rateLimiter = createRateLimiter({
+  perMinute: config.rateLimitPerMinute,
+  burst: config.rateLimitBurst || config.rateLimitPerMinute,
+  maxKeys: config.rateLimitMaxKeys,
+  trustProxy: config.trustProxy,
+});
+
+/**
+ * 运行时重新配置限流。
+ * @param {number} perMinute 每分钟额度，0 表示关闭
+ * @param {number} [burst] 突发容量
+ */
+export function setRateLimit(perMinute, burst) {
+  rateLimiter = createRateLimiter({
+    perMinute,
+    burst: burst || perMinute,
+    maxKeys: config.rateLimitMaxKeys,
+    trustProxy: config.trustProxy,
+  });
+  return rateLimiter;
+}
+
+/** 取限流器当前状态。 */
+export function rateLimitStats() {
+  return rateLimiter.stats();
+}
 
 /**
  * 公共响应头。
@@ -48,6 +89,11 @@ function baseHeaders(extra = {}) {
   if (config.cors) {
     headers['access-control-allow-origin'] = '*';
     headers['access-control-expose-headers'] = '*';
+  }
+  if (config.securityHeaders) {
+    // 禁止浏览器 MIME 嗅探：否则「包内放一个名字像脚本、内容是 HTML 的文件」
+    // 可能被浏览器当成脚本来执行。jsDelivr 也发送这个头。
+    headers['x-content-type-options'] = 'nosniff';
   }
   for (const [key, value] of Object.entries(headers)) {
     // eslint-disable-next-line no-control-regex
@@ -75,14 +121,21 @@ function sendJson(res, status, payload, extraHeaders = {}) {
 /** 发送 HTML 响应。 */
 function sendHtml(res, status, html, extraHeaders = {}, method = 'GET') {
   const body = Buffer.from(html, 'utf8');
-  res.writeHead(
-    status,
-    baseHeaders({
-      'content-type': 'text/html; charset=utf-8',
-      'content-length': String(body.length),
-      ...extraHeaders,
-    }),
-  );
+  /** @type {Record<string,string>} */
+  const headers = {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': String(body.length),
+    ...extraHeaders,
+  };
+  if (config.securityHeaders && !headers['content-security-policy']) {
+    // 本服务的 HTML 只有目录列表页和服务首页，都是纯静态内联样式：
+    // 放开 style，其余一律禁止。这样即使某个环节的转义出了问题，
+    // 注入的脚本也无法执行、无法外联 —— 属于纵深防御的第二层。
+    headers['content-security-policy'] =
+      "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'";
+    headers['referrer-policy'] = 'no-referrer';
+  }
+  res.writeHead(status, baseHeaders(headers));
   res.end(method === 'HEAD' ? undefined : body);
 }
 
@@ -163,6 +216,7 @@ async function serveFile(req, res, pkg, relPath, route, options = {}) {
         `压缩 ${relPath}: ${formatBytes(result.original)} → ${formatBytes(result.minified)}` +
           `（${(result.ratio * 100).toFixed(1)}%）`,
       );
+      metrics.minifySaved(Math.max(0, result.original - result.minified));
     }
   }
 
@@ -175,12 +229,42 @@ async function serveFile(req, res, pkg, relPath, route, options = {}) {
     20,
   )}"`;
 
+  /**
+   * Last-Modified 取「该版本解包落盘的时间」，而不是当前时间。
+   *
+   * 这里修掉了一个真实缺陷：原实现写的是 `new Date().toUTCString()`，
+   * 意味着**同一个文件每次请求返回的 Last-Modified 都不一样** ——
+   * 这个头就完全失去了意义，而且会让「按时间做增量同步」的客户端永远认为内容变了。
+   *
+   * 用解包时间的好处是它对同一个版本稳定（除非缓存被清空后重新解包）；
+   * 即使它变化，RFC 7232 也规定 ETag 优先级更高，不会造成错误。
+   */
+  const lastModifiedDate = new Date(pkg.storedAt || Date.now());
+  const lastModified = lastModifiedDate.toUTCString();
+  const cacheControl = pinned ? 'public, max-age=31536000, immutable' : 'public, max-age=600';
+
   // ---- 条件请求：命中就直接 304 ----
+  // RFC 7232 §6：If-None-Match 存在时忽略 If-Modified-Since
   const ifNoneMatch = req.headers['if-none-match'];
-  if (ifNoneMatch && ifNoneMatch.split(',').some((t) => t.trim() === etag)) {
+  const ifModifiedSince = req.headers['if-modified-since'];
+  let notModified = false;
+
+  if (ifNoneMatch) {
+    notModified = ifNoneMatch.split(',').some((t) => t.trim() === etag || t.trim() === '*');
+  } else if (ifModifiedSince) {
+    const since = Date.parse(ifModifiedSince);
+    // HTTP 日期只有秒精度，留 1 秒容差，避免同秒内被判定为「已修改」
+    if (Number.isFinite(since) && lastModifiedDate.getTime() <= since + 999) {
+      notModified = true;
+    }
+  }
+
+  if (notModified) {
+    metrics.cacheAccess('client-revalidate', true);
     res.writeHead(304, baseHeaders({
       etag,
-      'cache-control': pinned ? 'public, max-age=31536000, immutable' : 'public, max-age=600',
+      'last-modified': lastModified,
+      'cache-control': cacheControl,
       'x-byr-package': pkg.name,
       'x-byr-version': pkg.version,
     }));
@@ -192,8 +276,8 @@ async function serveFile(req, res, pkg, relPath, route, options = {}) {
     'content-type': contentType,
     etag,
     'accept-ranges': 'bytes',
-    'last-modified': new Date().toUTCString(),
-    'cache-control': pinned ? 'public, max-age=31536000, immutable' : 'public, max-age=600',
+    'last-modified': lastModified,
+    'cache-control': cacheControl,
     'x-byr-package': pkg.name,
     'x-byr-version': pkg.version,
     'x-byr-resolution': pkg.how,
@@ -242,6 +326,7 @@ async function serveFile(req, res, pkg, relPath, route, options = {}) {
       headers.vary = 'accept-encoding';
       headers['content-length'] = String(compressed.length);
       headers['x-byr-compressed'] = `${body.length}->${compressed.length}`;
+      metrics.compressionSaved(body.length - compressed.length, encoding);
       res.writeHead(200, baseHeaders(headers));
       res.end(method === 'HEAD' ? undefined : compressed);
       return;
@@ -355,11 +440,24 @@ async function handleFileRoute(req, res, pkg, route) {
   if (wantBundle && /\.(js|mjs|cjs)$/i.test(target)) {
     let mode = 'auto';
     if (Object.prototype.hasOwnProperty.call(route.query, 'esm')) mode = 'rewrite';
+
     const bundleValue = String(route.query.bundle ?? '').toLowerCase();
     if (['inline', 'cjs', '1', 'true'].includes(bundleValue)) mode = 'inline';
     if (['rewrite', 'esm', 'flatten'].includes(bundleValue)) mode = 'rewrite';
 
-    await bundleLib.serveBundle(req, res, pkg, target, route, { minify: needMinify, mode });
+    // 深度模式：继续把外部依赖也递归内联进来，即题面说的「把多个依赖合并成一个文件」。
+    // 两种写法都支持：`?bundle=deep` 与 `?bundle&deep=1`。
+    const deepParam = route.query.deep;
+    const deep =
+      bundleValue === 'deep' ||
+      (deepParam !== undefined && !['0', 'false', 'no'].includes(String(deepParam).toLowerCase()));
+    if (bundleValue === 'deep') mode = 'inline';
+
+    await bundleLib.serveBundle(req, res, pkg, target, route, {
+      minify: needMinify,
+      mode,
+      deep,
+    });
     return;
   }
 
@@ -375,11 +473,43 @@ async function handleFileRoute(req, res, pkg, route) {
 export async function handleRequest(req, res) {
   const startedAt = process.hrtime.bigint();
 
+  /**
+   * 快照最终写出的响应头。
+   *
+   * 为什么必须这么做：**响应刷出之后 `res.getHeader()` / `res.getHeaders()` 一律返回空**
+   * （Node 把标头交给 socket 时会清掉内部的标头表；实测 Node 22 下
+   * 连 `writeHead()` 之后立刻取 `getHeaders()` 也已经是空的）。
+   * 最初直接在 `finish` 事件里读 `res.getHeader('content-length')`，
+   * 结果是「发送字节数永远是 0」，日志里的 `[版本]` 后缀也从来没出现过 ——
+   * 一个静默失效的诊断能力，比直接报错更难发现。
+   *
+   * 所以这里改成**从 writeHead 的参数里取**，完全不依赖 Node 的内部实现细节：
+   * 本服务所有响应路径都是 `res.writeHead(status, {...})` 的调用形态。
+   */
+  /** @type {Record<string, any>} */
+  const finalHeaders = {};
+  const originalWriteHead = res.writeHead.bind(res);
+  res.writeHead = (...args) => {
+    const result = originalWriteHead(...args);
+    const maybeHeaders = args[args.length - 1];
+    if (maybeHeaders && typeof maybeHeaders === 'object' && !Array.isArray(maybeHeaders)) {
+      Object.assign(finalHeaders, maybeHeaders);
+    }
+    return result;
+  };
+
   res.on('finish', () => {
-    const ms = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    const seconds = Number(process.hrtime.bigint() - startedAt) / 1e9;
+    metrics.httpRequest({
+      method: req.method || 'GET',
+      status: res.statusCode,
+      durationSeconds: seconds,
+      bytes: Number(finalHeaders['content-length'] || 0),
+      encoding: String(finalHeaders['content-encoding'] || 'identity'),
+    });
     logger.info(
-      `${req.method} ${req.url} → ${res.statusCode} ${ms.toFixed(1)}ms` +
-        (res.getHeader('x-byr-version') ? ` [${res.getHeader('x-byr-version')}]` : ''),
+      `${req.method} ${req.url} -> ${res.statusCode} ${(seconds * 1000).toFixed(1)}ms` +
+        (finalHeaders['x-byr-version'] ? ` [${finalHeaders['x-byr-version']}]` : ''),
     );
   });
 
@@ -400,6 +530,25 @@ export async function handleRequest(req, res) {
     return;
   }
 
+  // ---- 限流 ----
+  if (rateLimiter.enabled) {
+    const key = clientKey(req, config.trustProxy);
+    const limited = rateLimiter.check(key);
+    if (limited) {
+      metrics.rateLimited(limited.limit);
+      logger.info(`限流拒绝 ${key} ${req.url}`);
+      res.writeHead(429, baseHeaders({
+        'content-type': 'application/json; charset=utf-8',
+        'retry-after': String(limited.retryAfter),
+        'x-ratelimit-limit': String(limited.limit),
+        'x-ratelimit-remaining': '0',
+        'x-ratelimit-reset': String(Math.ceil(limited.resetAt / 1000)),
+      }));
+      res.end(JSON.stringify({ error: '请求过于频繁，请稍后重试', status: 429, retryAfter: limited.retryAfter }));
+      return;
+    }
+  }
+
   let route;
   try {
     route = parseRoute(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -414,7 +563,11 @@ export async function handleRequest(req, res) {
         sendHtml(
           res,
           200,
-          renderServiceIndex({ registry: config.registry, port: config.port }),
+          renderServiceIndex({
+            registry: config.registry,
+            registrySource: config.registrySource,
+            port: config.port,
+          }),
           { 'cache-control': 'public, max-age=60' },
           req.method,
         );
@@ -429,20 +582,58 @@ export async function handleRequest(req, res) {
         }, { 'cache-control': 'no-store' });
         return;
 
+      case 'metrics': {
+        if (!config.metrics) throw notFound('指标接口已关闭（METRICS=0）');
+        const body = renderPrometheus();
+        res.writeHead(200, baseHeaders({
+          // Prometheus 的文本格式，不用 application/json
+          'content-type': 'text/plain; version=0.0.4; charset=utf-8',
+          'content-length': String(Buffer.byteLength(body)),
+          'cache-control': 'no-store',
+        }));
+        res.end(req.method === 'HEAD' ? undefined : body);
+        return;
+      }
+
       case 'stats': {
         const disk = await cache.diskStats();
         sendJson(res, 200, {
-          upstream: config.registry,
+          upstream: {
+            registry: config.registry,
+            // 解释「为什么是这个源」：env:REGISTRY / npmrc:registry / default
+            source: config.registrySource,
+            authenticated: Boolean(config.registryToken),
+            tokenType: config.registryTokenType,
+            npmrc: config.npmrcSources.map((s) => ({ path: s.path, keys: s.keys })),
+          },
           memoryCache: cache.memory.stats(),
           diskCache: disk,
+          extraction: store.extractStats(),
+          rateLimit: rateLimiter.stats(),
+          metrics: metricsSnapshot(),
           config: {
             ttl: config.ttl,
             maxTarballBytes: config.maxTarballBytes,
             memoryCacheBytes: config.memoryCacheBytes,
+            maxConcurrentExtract: config.maxConcurrentExtract,
+            bundleMaxDepth: config.bundleMaxDepth,
             minify: config.minify,
             compress: config.compress,
+            securityHeaders: config.securityHeaders,
           },
         }, { 'cache-control': 'no-store' });
+        return;
+      }
+
+      case 'api': {
+        if (!config.api) throw notFound('包信息接口已关闭（API=0）');
+        const pkg = await store.loadPackage(route.name, route.versionSpec);
+        sendJson(res, 200, api.handle(route, pkg), {
+          'cache-control': 'public, max-age=300',
+          'x-byr-package': pkg.name,
+          'x-byr-version': pkg.version,
+          'x-byr-resolution': pkg.how,
+        });
         return;
       }
 
@@ -486,4 +677,4 @@ export async function handleRequest(req, res) {
   }
 }
 
-export default { handleRequest, parseRange };
+export default { handleRequest, parseRange, setRateLimit, rateLimitStats };

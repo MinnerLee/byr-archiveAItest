@@ -120,7 +120,7 @@ function sameTriplet(a, b) {
  * 把单个比较符展开成 `>=` / `<` 边界组合。
  * 返回 comparator 数组：{op, ver}
  */
-function expandOperator(op, ver, hasMinor, hasPatch) {
+function expandOperator(op, ver, hasMinor, hasPatch, wild = {}) {
   const p = ver;
   const out = [];
 
@@ -177,16 +177,23 @@ function expandOperator(op, ver, hasMinor, hasPatch) {
       }
       break;
 
-    case '^': // ^1.2.3 -> >=1.2.3 <2.0.0 ; ^0.2.3 -> >=0.2.3 <0.3.0 ; ^0.0.3 -> >=0.0.3 <0.0.4
+    /**
+     * `^` 的语义是「不改变最左边非零的那一位」：
+     *   ^1.2.3 -> >=1.2.3 <2.0.0      ^0.2.3 -> >=0.2.3 <0.3.0
+     *   ^0.0.3 -> >=0.0.3 <0.0.4      ^1.x   -> >=1.0.0 <2.0.0
+     *   ^0.x   -> >=0.0.0 <1.0.0      ^0.0.x -> >=0.0.0 <0.1.0
+     * 分支顺序很关键：必须**先判断 minor 是否非零**，否则 `^0.2.x`
+     * 会被误判成 `^0.x` 而展开到 <1.0.0。
+     */
+    case '^':
       out.push({ op: '>=', ver: p });
-      if (!hasMinor) {
+      if (!hasMinor || wild.minor) {
         out.push({ op: '<', ver: { ...p, major: p.major + 1, minor: 0, patch: 0, prerelease: [] } });
       } else if (p.major > 0) {
         out.push({ op: '<', ver: { ...p, major: p.major + 1, minor: 0, patch: 0, prerelease: [] } });
-      } else if (!hasPatch) {
-        // ^0.x -> <1.0.0
-        out.push({ op: '<', ver: { ...p, major: 1, minor: 0, patch: 0, prerelease: [] } });
       } else if (p.minor > 0) {
+        out.push({ op: '<', ver: { ...p, minor: p.minor + 1, patch: 0, prerelease: [] } });
+      } else if (wild.patch || !hasPatch) {
         out.push({ op: '<', ver: { ...p, minor: p.minor + 1, patch: 0, prerelease: [] } });
       } else {
         out.push({ op: '<', ver: { ...p, patch: p.patch + 1, prerelease: [] } });
@@ -265,20 +272,53 @@ function parseComparatorSet(chunk) {
     const base = parse(`${major}.${minor}.${patch}${minorW || patchW ? '' : suffix}`);
     if (!base) throw new TypeError(`无法解析版本: ${spec}`);
 
-    if (minorW) {
-      // 1.x / 1.* -> >=1.0.0 <2.0.0
-      out.push({ op: '>=', ver: base });
-      out.push({ op: '<', ver: { ...base, major: base.major + 1, minor: 0, patch: 0, prerelease: [] } });
-      continue;
-    }
-    if (patchW) {
-      // 1.2.x -> >=1.2.0 <1.3.0
-      out.push({ op: '>=', ver: base });
-      out.push({ op: '<', ver: { ...base, minor: base.minor + 1, patch: 0, prerelease: [] } });
+    // 注意：`~1` / `^1` 这类「运算符 + 不完整版本」**不是**通配符，
+    // 必须交给 expandOperator 按各自的语义展开；只有裸版本或带比较符的
+    // `x`/`*` 才是真正的通配符。
+    if ((minorW || patchW) && op !== '~' && op !== '^') {
+      /**
+       * 通配符展开必须**尊重原来的比较符**，这是 node-semver 的规则：
+       *
+       *   1.x     -> >=1.0.0 <2.0.0      <1.x    -> <1.0.0
+       *   >1.x    -> >=2.0.0             <=1.x   -> <2.0.0
+       *   1.2.x   -> >=1.2.0 <1.3.0      <1.2.x  -> <1.2.0
+       *   >=1.2.x -> >=1.2.0             <=1.2.x -> <1.3.0
+       *
+       * 最初的实现无条件展开成 `>=low <high`，于是 `< 3` 被错误地变成
+       * `>=3.0.0 <4.0.0` —— 这个 bug 是在深度打包 `safer-buffer` 时暴露的
+       * （它的依赖范围是 `>= 2.1.2 < 3`，结果永远匹配不到任何版本）。
+       */
+      const low = base;
+      const high = minorW
+        ? { ...base, major: base.major + 1, minor: 0, patch: 0, prerelease: [] }
+        : { ...base, minor: base.minor + 1, patch: 0, prerelease: [] };
+
+      switch (op) {
+        case '':
+        case '=':
+          out.push({ op: '>=', ver: low });
+          out.push({ op: '<', ver: high });
+          break;
+        case '>':
+          // `>1.2.x` 的语义是「比 1.2 这整个系列都大」，即 >= 下一个系列
+          out.push({ op: '>=', ver: high });
+          break;
+        case '>=':
+          out.push({ op: '>=', ver: low });
+          break;
+        case '<':
+          out.push({ op: '<', ver: low });
+          break;
+        case '<=':
+          out.push({ op: '<', ver: high });
+          break;
+        default:
+          throw new TypeError(`通配符不支持比较符: ${op}${spec}`);
+      }
       continue;
     }
 
-    out.push(...expandOperator(op, base, hasMinor, hasPatch));
+    out.push(...expandOperator(op, base, hasMinor, hasPatch, { minor: minorW, patch: patchW }));
   }
 
   if (!matchedAny) throw new TypeError(`无法解析版本范围: ${text}`);

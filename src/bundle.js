@@ -1,44 +1,53 @@
 /**
- * 打包 / 依赖重写（可选功能 3 的「打包」部分）。
+ * 打包 / 依赖重写。
  *
- * 题目原话：「参考 jsdelivr 和 esm.sh 的功能提供 压缩/打包 功能
- *           （例如把 JS 文件最小化，把多个依赖合并成一个文件）」。
+ * 对应可选功能 3 的「打包」部分：「把多个依赖合并成一个文件」。
  *
- * 这里实现两种模式，通过查询参数选择：
+ * 一共三种模式：
  *
  *   1. `?bundle`（默认）—— **Inline 模式**
- *      从入口文件出发，把包内所有**相对依赖**（`require('./x')`）递归收集起来，
- *      内联进一个文件，配一个不到 30 行的微型模块运行时。
- *      输出是一个自包含的、可以直接 `<script>` 引入的文件。
+ *      从入口文件出发，把包内所有**相对依赖**（`require('./x')`）递归内联进一个文件，
+ *      配一个微型模块运行时。产出自包含，可直接 `<script>` 引入。
  *
- *   2. `?esm` 或 `?bundle=rewrite` —— **Rewrite 模式**
- *      不合并，而是把所有 import 说明符（相对路径 + 外部包）重写成
- *      **指向本服务的绝对 URL**，并且顺带把外部包的版本锁定到精确版本
- *      （例如 `import 'lodash'` → `import '/npm/lodash@4.17.21/lodash.js'`）。
- *      这正是 jsDelivr `+esm` 与 esm.sh 的真实做法，也是浏览器里唯一
- *      真正可行的「裸模块说明符」处理方式。
+ *   2. `?bundle=deep` —— **Deep Inline 模式**
+ *      在 Inline 的基础上，**继续把外部依赖（裸说明符）也拉进来**：
+ *      按照 package.json 的 dependencies 范围解析版本 → 下载那个包 → 解包 →
+ *      把它的入口也内联进来，并对其内部的依赖递归处理（受深度与模块数上限约束）。
+ *      这才是真正意义上的「把多个依赖合并成一个文件」。
  *
- * 自动选择：入口文件里出现 ESM 语法（`import` / `export`）就自动走 Rewrite 模式，
- * 因为把 ESM 内联成单文件需要完整实现「导入提升 + 活绑定」，那是一个真正的
- * 编译器工程（rollup / esbuild 的量级），不适合塞进这个「最简 CDN」。
- * 与其给出一个能跑通 demo、但在真实代码上静默出错的实现，不如把边界画清楚。
+ *   3. `?esm` / `?bundle=rewrite` —— **Rewrite 模式**
+ *      不合并，把所有 import 说明符（相对路径 + 外部包）重写成**指向本服务的绝对 URL**
+ *      并把外部包锁定到精确版本（`import 'lodash'` → `import '/npm/lodash@4.17.21/lodash.js'`）。
+ *      这正是 jsDelivr `+esm` 与 esm.sh 的真实做法，也是浏览器里唯一真正可行的
+ *      「裸模块说明符」处理方式。
+ *
+ * 自动选择：入口文件里出现 ESM 语法（`import` / `export`）就走 Rewrite 模式，
+ * 因为把 ESM 内联成单文件需要完整的「导入提升 + 活绑定」实现，
+ * 那是 rollup / esbuild 量级的编译器工程。与其给出一个在 demo 上能跑、
+ * 在真实代码上静默出错的实现，不如把边界画清楚。
+ *
+ * 模块标识：统一用 `包名@版本/包内路径`。这样跨包内联时，
+ * 「哪个模块属于哪个包」是显式的，相对路径与裸说明符的解析规则也一目了然。
  */
 
 import config from './config.js';
 import logger from './logger.js';
 import * as store from './store.js';
 import * as registry from './registry.js';
-import * as cache from './cache.js';
 import * as compress from './compress.js';
 import { tokenize, minifyJavaScript } from './minify.js';
-import { escapeHtml, formatBytes, encodePathSegment } from './util.js';
-import { notFound, tooLarge } from './errors.js';
+import { formatBytes, encodePathSegment } from './util.js';
+import { tooLarge } from './errors.js';
+import { metrics } from './metrics.js';
 
-/** 单次打包允许内联的最大模块数，防止一个包把整个 dist 目录拖进来。 */
-const MAX_MODULES = 120;
+/** 单次打包允许内联的最大模块数（可通过配置覆盖）。 */
+const DEFAULT_MAX_MODULES = 120;
 
 /** 单次打包允许的源码总量上限。 */
-const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_SOURCE_BYTES = 8 * 1024 * 1024;
+
+/** 深度打包默认最大深度。 */
+const DEFAULT_MAX_DEPTH = 3;
 
 /** Node 内置模块名单（这些不应该被当作 npm 包去解析）。 */
 const NODE_BUILTINS = new Set([
@@ -55,12 +64,50 @@ function unquote(raw) {
   return raw.slice(1, -1);
 }
 
+/**
+ * 判断一个说明符是否是 Node 内置模块（`fs`、`node:path` ...）。
+ * @param {string} spec
+ */
+function isNodeBuiltinSpec(spec) {
+  if (spec.startsWith('node:')) return true;
+  const { name } = splitBareSpec(spec);
+  return NODE_BUILTINS.has(name);
+}
+
 /** 判断说明符是否为「包内相对路径」。 */
 function isRelativeSpec(spec) {
   return spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('/');
 }
 
-/** 拆分裸说明符为「包名 + 子路径」，正确处理 scoped 包。 */
+/**
+ * 判断说明符是不是一个外部 URL（http/https/data/node 协议），这类不当作 npm 包解析。
+ *
+ * 这里有个必须注意的坑：**不能用 `startsWith('http')` 来判定 URL** ——
+ * `'http-errors'.startsWith('http')` 也是 true，于是 `http-errors`、`http-proxy`
+ * 这些包会被静默跳过。这个 bug 是在深度打包 express 时暴露的：
+ * 67 个包里唯独缺了 `http-errors`，产物一运行就报 "Cannot find module 'http-errors'"。
+ */
+const URL_LIKE = /^(?:[a-z][a-z0-9+.-]*:\/\/|node:|data:)/i;
+
+/**
+ * @param {string} spec
+ * @returns {boolean}
+ */
+function isUrlLike(spec) {
+  return URL_LIKE.test(spec);
+}
+
+/** 模块 id 生成规则：`包名@版本/包内路径`。 */
+function moduleId(name, version, filePath) {
+  return `${name}@${version}/${filePath}`;
+}
+
+/**
+ * 拆分裸说明符为「包名 + 子路径」，正确处理 scoped 包。
+ *
+ * @param {string} spec 例如 `lodash/fp`、`@vue/shared/dist/a.js`
+ * @returns {{name:string, subpath:string}}
+ */
 export function splitBareSpec(spec) {
   const parts = spec.split('/');
   if (spec.startsWith('@')) {
@@ -145,14 +192,12 @@ export function findSpecifiers(source) {
     if (token.value === 'import') {
       const next = nextSignificant(i);
 
-      // 静态 import：import 'x' / import x from 'x' / import {a} from 'x' / import * as n from 'x'
       if (next && next.type === 'string') {
         hasEsm = true;
         push('import', next);
       } else if (next && next.value === '.') {
         hasEsm = true; // import.meta
       } else if (next && next.value === '(') {
-        // 动态 import：不改语义，但同样需要重写目标
         const arg = nextSignificant(tokens.indexOf(next));
         if (arg && arg.type === 'string') push('dynamic-import', arg);
       } else {
@@ -177,10 +222,9 @@ export function findSpecifiers(source) {
 }
 
 /**
- * 解析相对说明符为包内真实文件路径。
+ * 把相对说明符解析为包内真实文件路径。
  *
- * 依次尝试：原样 → 补扩展名 → 当作目录取 index.* →
- * 当作目录读它的 package.json main。
+ * 依次尝试：原样 → 补扩展名 → 当作目录取 index.*。
  *
  * @param {string} fromPath 引用方在包内的路径
  * @param {string} spec 相对说明符
@@ -201,6 +245,11 @@ export function resolveRelativeSpec(fromPath, spec, exists) {
   const base = segments.join('/');
   if (base === '') return null;
 
+  return resolveCandidate(base, exists);
+}
+
+/** 在一个包内，把「不带扩展名的路径」解析成真实文件。 */
+function resolveCandidate(base, exists) {
   const candidates = [
     base,
     `${base}.js`,
@@ -226,77 +275,167 @@ export function cdnUrl(name, version, filePath) {
 }
 
 /**
- * 把相对说明符批量重写成绝对 URL。
- * @param {string} source
- * @param {Array<{start:number,end:number,text:string}>} rewrites
+ * 把一个外部依赖解析成「已解包的包 + 入口文件路径」。
+ *
+ * 版本范围取自**引用方**的 package.json（`dependencies` / `peerDependencies` /
+ * `optionalDependencies`），这保证了「内联进来的版本」与 npm 实际安装的版本一致。
+ * 解析出的包会进入缓存，所以同一依赖被多处引用时只下载一次。
+ *
+ * @param {import('./store.js').MaterializedPackage} ownerPkg 引用方所在的包
+ * @param {string} spec 裸说明符
+ * @param {Map<string, any>} depCache 本次打包内的依赖缓存
+ * @returns {Promise<{pkg:any, path:string}|null>}
  */
-function applyRewrites(source, rewrites) {
-  const sorted = [...rewrites].sort((a, b) => b.start - a.start);
-  let out = source;
-  for (const rw of sorted) {
-    out = out.slice(0, rw.start) + rw.text + out.slice(rw.end);
+async function resolveBareModule(ownerPkg, spec, depCache) {
+  if (isUrlLike(spec)) return null;
+
+  const { name, subpath } = splitBareSpec(spec);
+  if (!name || NODE_BUILTINS.has(name)) return null;
+  if (!registry.isValidName(name)) return null;
+
+  const deps = {
+    ...(ownerPkg.manifest.dependencies || {}),
+    ...(ownerPkg.manifest.peerDependencies || {}),
+    ...(ownerPkg.manifest.optionalDependencies || {}),
+  };
+  const range = deps[name] || 'latest';
+  const cacheKey = `${name}@${range}`;
+
+  let depPkg = depCache.get(cacheKey);
+  if (!depPkg) {
+    const resolved = await registry.resolveVersion(name, range);
+    depPkg = await store.loadPackage(name, resolved.version);
+    depCache.set(cacheKey, depPkg);
+    logger.debug(`深度打包：锁定依赖 ${name}@${resolved.version}（范围 ${range}）`);
   }
-  return out;
+
+  // 解析依赖包的入口时启用 Node 默认解析：这里模拟的是 Node 的模块解析语义，
+  // 而不是本服务 URL 的入口语义。真实世界里确实有包不写 main（如 mime@3.0.0），
+  // 靠 Node 的 index.js 默认解析工作。
+  const filePath = subpath
+    ? resolveCandidate(subpath, (p) => depPkg.fileIndex.has(p))
+    : store.resolveEntry(depPkg, { nodeDefault: true }).path;
+
+  if (!filePath || !depPkg.fileIndex.has(filePath)) return null;
+  return { pkg: depPkg, path: filePath };
 }
 
 /**
- * 收集 CJS 模块图。
+ * 收集模块图。
  *
- * @param {import('./store.js').MaterializedPackage} pkg
- * @param {string} entryId
- * @returns {Promise<{modules:Map<string,{id:string, source:string, specifiers:any[], hasEsm:boolean}>, totalBytes:number, truncated:boolean}>}
+ * @param {import('./store.js').MaterializedPackage} rootPkg
+ * @param {string} entryPath
+ * @param {object} options
+ * @param {boolean} [options.deep] 是否递归内联外部依赖
+ * @param {number} [options.maxDepth]
+ * @param {number} [options.maxModules]
+ * @param {number} [options.maxBytes]
+ * @returns {Promise<{modules:Map<string, any>, totalBytes:number, truncated:boolean, externalCount:number, entryId:string}>}
  */
-async function collectGraph(pkg, entryId) {
-  /** @type {Map<string,{id:string, source:string, specifiers:any[], hasEsm:boolean}>} */
+async function collectGraph(rootPkg, entryPath, options = {}) {
+  const deep = Boolean(options.deep);
+  const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
+  const maxModules = options.maxModules ?? DEFAULT_MAX_MODULES;
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_SOURCE_BYTES;
+
+  /** @type {Map<string, any>} */
   const modules = new Map();
-  const queue = [entryId];
+  /** @type {Map<string, any>} */
+  const depCache = new Map();
+
+  const entryId = moduleId(rootPkg.name, rootPkg.version, entryPath);
+  const queue = [{ pkg: rootPkg, path: entryPath, depth: 0 }];
+
   let totalBytes = 0;
   let truncated = false;
+  let externalCount = 0;
+  /** 记录「哪些说明符最终没能内联」，用于诊断与产物注释 */
+  /** @type {Map<string,string[]>} spec -> 引用它的模块 id 列表 */
+  const unresolved = new Map();
+
+  const markUnresolved = (spec, fromId) => {
+    const list = unresolved.get(spec);
+    if (list) {
+      if (list.length < 5) list.push(fromId);
+    } else {
+      unresolved.set(spec, [fromId]);
+    }
+  };
 
   while (queue.length > 0) {
-    const id = queue.shift();
+    const item = queue.shift();
+    const id = moduleId(item.pkg.name, item.pkg.version, item.path);
     if (modules.has(id)) continue;
-    if (modules.size >= MAX_MODULES) {
+
+    if (modules.size >= maxModules) {
       truncated = true;
       break;
     }
 
-    const { buffer } = await store.readFile(pkg, id);
+    const { buffer } = await store.readFile(item.pkg, item.path);
     totalBytes += buffer.length;
-    if (totalBytes > MAX_SOURCE_BYTES) {
+    if (totalBytes > maxBytes) {
       throw tooLarge(
-        `打包源码总量超过上限 ${formatBytes(MAX_SOURCE_BYTES)}，请改用 ?esm 重写模式`,
+        `打包源码总量超过上限 ${formatBytes(maxBytes)}，请改用 ?esm 重写模式或减少 --deep 深度`,
         { bytes: totalBytes },
       );
     }
 
     const source = buffer.toString('utf8');
     const { specifiers, hasEsm } = findSpecifiers(source);
-    modules.set(id, { id, source, specifiers, hasEsm });
 
-    for (const item of specifiers) {
-      if (!isRelativeSpec(item.spec)) continue;
-      const target = resolveRelativeSpec(id, item.spec, (p) => pkg.fileIndex.has(p));
-      if (target && !modules.has(target)) queue.push(target);
+    /** @type {Record<string,string>} 说明符 → 目标模块 id */
+    const resolved = {};
+
+    const mod = {
+      id,
+      path: item.path,
+      pkg: item.pkg,
+      source,
+      specifiers,
+      hasEsm,
+      resolved,
+      depth: item.depth,
+    };
+    modules.set(id, mod);
+
+    for (const s of specifiers) {
+      if (isRelativeSpec(s.spec)) {
+        const target = resolveRelativeSpec(item.path, s.spec, (p) => item.pkg.fileIndex.has(p));
+        if (target) {
+          resolved[s.spec] = moduleId(item.pkg.name, item.pkg.version, target);
+          queue.push({ pkg: item.pkg, path: target, depth: item.depth });
+        }
+        continue;
+      }
+
+      // ---- 外部依赖 ----
+      if (!deep || item.depth >= maxDepth) {
+        externalCount += 1;
+        markUnresolved(s.spec, id);
+        continue;
+      }
+
+      let found = null;
+      try {
+        found = await resolveBareModule(item.pkg, s.spec, depCache);
+      } catch (err) {
+        // 单个依赖解析失败不应该毁掉整个打包：退回「不内联」，
+        // 运行时由 __nodeRequire 兜底，并在产物注释里说明。
+        logger.debug(`依赖 ${s.spec}（被 ${id} 引用）解析失败: ${err.message}`);
+      }
+
+      if (found) {
+        resolved[s.spec] = moduleId(found.pkg.name, found.pkg.version, found.path);
+        queue.push({ pkg: found.pkg, path: found.path, depth: item.depth + 1 });
+      } else {
+        externalCount += 1;
+        markUnresolved(s.spec, id);
+      }
     }
   }
 
-  return { modules, totalBytes, truncated };
-}
-
-/** 构造「引用方 + 说明符 → 模块 id」的解析表。 */
-function buildResolveTable(modules) {
-  const table = {};
-  for (const mod of modules.values()) {
-    for (const item of mod.specifiers) {
-      if (!isRelativeSpec(item.spec)) continue;
-      const target = resolveRelativeSpec(mod.id, item.spec, (p) =>
-        [...modules.keys()].includes(p),
-      );
-      if (target) table[`${mod.id}\u0000${item.spec}`] = target;
-    }
-  }
-  return table;
+  return { modules, totalBytes, truncated, externalCount, entryId, unresolved };
 }
 
 /** 把普通文本安全地嵌进 JS 字符串字面量。 */
@@ -305,26 +444,94 @@ function jsString(text) {
 }
 
 /**
- * 生成 Inline 单文件 bundle。
- * @param {import('./store.js').MaterializedPackage} pkg
- * @param {string} entryId
- * @param {Map<string,{id:string,source:string,specifiers:any[],hasEsm:boolean}>} modules
- * @param {{truncated?:boolean}} [extra]
+ * 把模块源码转换成「可以安全塞进函数体」的形式。
+ *
+ * 这一步是被真实包教出来的，两个必须处理的坑：
+ *
+ * 1. **`.json` 文件不是合法的 JS 语句**。
+ *    `require('./codes.json')` 里的文件内容是 `{"100":"Continue",...}`。
+ *    如果原样塞进 `function(module,exports,require){ ... }` 的函数体，
+ *    花括号会被解析成一个**块语句**，于是 `"100": "Continue"` 直接语法报错。
+ *    正确做法是把它变成一个表达式：`module.exports = {...};`。
+ *    （这个 bug 是在深度打包 express 时，内联 `statuses` 包的 `codes.json` 暴露的。）
+ *
+ * 2. **shebang 行（`#!...`）在函数体里是语法错误**。
+ *    很多包的 CLI 文件以 `#!/usr/bin/env node` 开头，内联时必须去掉。
+ *    这里改写成同长度的行注释，保留行号信息便于定位。
+ *
+ * @param {{path:string, source:string}} mod
+ * @returns {string}
  */
-function emitInlineBundle(pkg, entryId, modules, extra = {}) {
-  const safeName = pkg.name.replace(/[^A-Za-z0-9_$]/g, '_');
-  const table = buildResolveTable(modules);
+function prepareModuleSource(mod) {
+  let source = mod.source;
+
+  // 去掉 UTF-8 BOM，它在函数体开头同样是非法字符
+  if (source.charCodeAt(0) === 0xfeff) source = source.slice(1);
+
+  if (/\.json$/i.test(mod.path)) {
+    try {
+      return `module.exports = ${JSON.stringify(JSON.parse(source))};`;
+    } catch {
+      // 不是合法 JSON（真实 npm 包里偶有带注释的 .json），按普通 JS 继续处理
+      logger.debug(`${mod.path} 声明为 .json 但无法解析，按 JS 处理`);
+    }
+  }
+
+  if (source.startsWith('#!')) {
+    const newline = source.indexOf('\n');
+    source = newline === -1 ? '' : `//${source.slice(2, newline)}\n${source.slice(newline + 1)}`;
+  }
+
+  return source;
+}
+
+/**
+ * 生成 Inline 单文件 bundle。
+ *
+ * @param {import('./store.js').MaterializedPackage} rootPkg
+ * @param {{modules:Map<string,any>, entryId:string, truncated:boolean, externalCount:number}} graph
+ * @param {{deep?:boolean}} [extra]
+ */
+function emitInlineBundle(rootPkg, graph, extra = {}) {
+  const { modules, entryId, truncated, externalCount, unresolved } = graph;
+  const safeName = rootPkg.name.replace(/[^A-Za-z0-9_$]/g, '_');
+
+  // 把所有「引用方 + 说明符 → 目标模块 id」的解析结果预先算成一张扁平表，
+  // 运行时 require 就是一次对象查表，不做任何路径字符串运算。
+  /** @type {Record<string,string>} */
+  const table = {};
+  for (const mod of modules.values()) {
+    for (const [spec, target] of Object.entries(mod.resolved)) {
+      table[`${mod.id}\u0000${spec}`] = target;
+    }
+  }
+
+  const packages = new Set([...modules.values()].map((m) => `${m.pkg.name}@${m.pkg.version}`));
 
   const parts = [];
   parts.push('/*!');
-  parts.push(` * BYR Archive bundle · ${pkg.name}@${pkg.version} · entry=${entryId}`);
-  parts.push(` * mode=inline-cjs · modules=${modules.size} · built=${new Date().toISOString()}`);
+  parts.push(` * BYR Archive bundle · entry=${entryId}`);
+  parts.push(
+    ` * mode=${extra.deep ? 'deep-inline' : 'inline'}-cjs · modules=${modules.size} · ` +
+      `packages=${packages.size} · built=${new Date().toISOString()}`,
+  );
   parts.push(' *');
-  parts.push(' * 本文件由 BYR Archive 即时生成：包内所有相对依赖已内联，无需再发额外请求。');
-  parts.push(' * 未被内联的外部依赖（如 require("lodash")）会在 Node 环境下透传给原生 require，');
-  parts.push(' * 在浏览器中则会抛出明确错误 —— 请改用 ?esm 重写模式。');
-  if (extra.truncated) {
-    parts.push(` * 注意：模块数达到上限 ${MAX_MODULES}，依赖图可能不完整。`);
+  parts.push(' * 本文件由 BYR Archive 即时生成：');
+  parts.push(' *   - 包内相对依赖已全部内联；');
+  if (extra.deep) {
+    parts.push(' *   - 外部依赖已按 package.json 的版本范围解析并递归内联（版本已锁定）。');
+  } else {
+    parts.push(' *   - 外部依赖未内联，保留为 require() 调用；加 ?bundle=deep 可继续内联。');
+  }
+  if (externalCount > 0) {
+    const nonBuiltin = [...unresolved.keys()].filter((k) => !isNodeBuiltinSpec(k));
+    parts.push(` *   - 仍有 ${externalCount} 个说明符未被内联。`);
+    if (nonBuiltin.length > 0) {
+      parts.push(` *     其中非 Node 内置的（需要在目标环境自行提供）：${nonBuiltin.slice(0, 12).join(', ')}${nonBuiltin.length > 12 ? ` 等 ${nonBuiltin.length} 个` : ''}`);
+    }
+  }
+  if (truncated) {
+    parts.push(` * 注意：模块数达到上限 ${DEFAULT_MAX_MODULES}，依赖图可能不完整。`);
   }
   parts.push(' */');
   parts.push('(function () {');
@@ -333,7 +540,7 @@ function emitInlineBundle(pkg, entryId, modules, extra = {}) {
 
   for (const mod of modules.values()) {
     parts.push(`${jsString(mod.id)}: function (module, exports, require, __filename) {`);
-    parts.push(mod.source);
+    parts.push(prepareModuleSource(mod));
     parts.push('},');
   }
 
@@ -344,8 +551,14 @@ function emitInlineBundle(pkg, entryId, modules, extra = {}) {
   parts.push('function __load(id) {');
   parts.push('  if (id in __cache) return __cache[id].exports;');
   parts.push('  if (!Object.prototype.hasOwnProperty.call(__defs, id)) {');
-  parts.push('    if (__nodeRequire) return __nodeRequire(id);');
-  parts.push('    throw new Error("[BYR Archive bundle] 外部依赖未内联: " + id + "（请改用 ?esm 重写模式）");');
+  parts.push('    if (__nodeRequire) {');
+  parts.push('      try { return __nodeRequire(id); }');
+  parts.push('      catch (err) {');
+  parts.push('        var hint = /^[a-z@]/.test(id) ? "该外部依赖未被内联，且本地 node_modules 里也没有。" : "该文件未被内联。";');
+  parts.push('        throw new Error("[BYR Archive bundle] 无法解析 " + id + "：" + hint + " 可提高 BUNDLE_MAX_DEPTH / BUNDLE_MAX_MODULES 后重新打包，或改用 ?esm 重写模式。");');
+  parts.push('      }');
+  parts.push('    }');
+  parts.push('    throw new Error("[BYR Archive bundle] 外部依赖未内联: " + id + "（可改用 ?esm 重写模式）");');
   parts.push('  }');
   parts.push('  var module = { exports: {} };');
   parts.push('  __cache[id] = module;');
@@ -371,26 +584,18 @@ function emitInlineBundle(pkg, entryId, modules, extra = {}) {
  * @param {string} spec
  * @returns {Promise<string|null>}
  */
-async function resolveBareSpec(pkg, spec) {
-  if (spec.startsWith('node:') || spec.startsWith('data:') || spec.startsWith('http')) return null;
+async function resolveBareSpecUrl(pkg, spec) {
+  if (isUrlLike(spec)) return null;
   const { name, subpath } = splitBareSpec(spec);
   if (!name || NODE_BUILTINS.has(name)) return null;
   if (!registry.isValidName(name)) return null;
 
-  const deps = {
-    ...(pkg.manifest.dependencies || {}),
-    ...(pkg.manifest.peerDependencies || {}),
-    ...(pkg.manifest.optionalDependencies || {}),
-  };
-  const range = deps[name] || 'latest';
-
   try {
-    const resolved = await registry.resolveVersion(name, range);
-    const depPkg = await store.loadPackage(name, resolved.version);
-    const file = subpath || store.resolveEntry(depPkg).path;
-    if (!depPkg.fileIndex.has(file)) return null;
-    logger.debug(`依赖锁定 ${spec} → ${name}@${resolved.version}/${file}`);
-    return cdnUrl(name, resolved.version, file);
+    const found = await resolveBareModule(pkg, spec, new Map());
+    if (!found) return null;
+    const url = cdnUrl(found.pkg.name, found.pkg.version, found.path);
+    logger.debug(`依赖锁定 ${spec} → ${found.pkg.name}@${found.pkg.version}/${found.path}`);
+    return url;
   } catch (err) {
     logger.debug(`无法锁定依赖 ${spec}: ${err.message}`);
     return null;
@@ -398,14 +603,27 @@ async function resolveBareSpec(pkg, spec) {
 }
 
 /**
+ * 把相对说明符批量重写成绝对 URL。
+ * @param {string} source
+ * @param {Array<{start:number,end:number,text:string}>} rewrites
+ */
+function applyRewrites(source, rewrites) {
+  const sorted = [...rewrites].sort((a, b) => b.start - a.start);
+  let out = source;
+  for (const rw of sorted) {
+    out = out.slice(0, rw.start) + rw.text + out.slice(rw.end);
+  }
+  return out;
+}
+
+/**
  * 生成 Rewrite 模式输出：只重写说明符，不做合并。
  *
  * @param {import('./store.js').MaterializedPackage} pkg
- * @param {string} entryId
+ * @param {string} entryPath
  * @param {string} source
- * @param {boolean} rewriteExternal 是否同时重写外部包说明符
  */
-async function emitRewrite(pkg, entryId, source, rewriteExternal = true) {
+async function emitRewrite(pkg, entryPath, source) {
   const { specifiers } = findSpecifiers(source);
   const rewrites = [];
   let internalCount = 0;
@@ -413,7 +631,7 @@ async function emitRewrite(pkg, entryId, source, rewriteExternal = true) {
 
   for (const item of specifiers) {
     if (isRelativeSpec(item.spec)) {
-      const target = resolveRelativeSpec(entryId, item.spec, (p) => pkg.fileIndex.has(p));
+      const target = resolveRelativeSpec(entryPath, item.spec, (p) => pkg.fileIndex.has(p));
       if (target) {
         rewrites.push({
           start: item.start,
@@ -425,8 +643,7 @@ async function emitRewrite(pkg, entryId, source, rewriteExternal = true) {
       continue;
     }
 
-    if (!rewriteExternal) continue;
-    const url = await resolveBareSpec(pkg, item.spec);
+    const url = await resolveBareSpecUrl(pkg, item.spec);
     if (url) {
       rewrites.push({ start: item.start, end: item.end, text: url });
       externalCount += 1;
@@ -435,12 +652,101 @@ async function emitRewrite(pkg, entryId, source, rewriteExternal = true) {
 
   const output = applyRewrites(source, rewrites);
   const banner =
-    `/*! BYR Archive · ${pkg.name}@${pkg.version} · entry=${entryId}\n` +
+    `/*! BYR Archive · ${pkg.name}@${pkg.version} · entry=${entryPath}\n` +
     ` * mode=rewrite · 已重写 ${internalCount} 个包内相对说明符、${externalCount} 个外部依赖\n` +
     ` * 所有 import 路径已指向本服务并锁定到精确版本，可直接被浏览器作为 ES Module 加载。\n` +
     ` */\n`;
 
   return { output: banner + output, internalCount, externalCount };
+}
+
+/**
+ * 生成打包产物（与 HTTP 无关，供 CLI 与 handler 共用）。
+ *
+ * @param {import('./store.js').MaterializedPackage} pkg
+ * @param {string} entryPath 包内入口文件路径
+ * @param {object} [options]
+ * @param {boolean} [options.deep] 是否递归内联外部依赖
+ * @param {'auto'|'inline'|'rewrite'} [options.mode]
+ * @param {boolean} [options.minify] 是否压缩产物
+ * @returns {Promise<{output:string, mode:string, modules:number, packages:number, bytes:number, reason:string, external:number}>}
+ */
+export async function bundleFile(pkg, entryPath, options = {}) {
+  const { buffer } = await store.readFile(pkg, entryPath);
+  const source = buffer.toString('utf8');
+  const probe = findSpecifiers(source);
+
+  let mode = options.mode ?? 'auto';
+  if (mode === 'auto') mode = probe.hasEsm ? 'rewrite' : 'inline';
+
+  let output;
+  let modeName;
+  let reason = '';
+  let modules = 0;
+  let packages = 1;
+  let external = 0;
+  /** @type {string[]} */
+  let unresolvedList = [];
+
+  if (mode === 'inline') {
+    const graph = await collectGraph(pkg, entryPath, {
+      deep: Boolean(options.deep),
+      maxDepth: config.bundleMaxDepth,
+      maxModules: options.deep ? config.bundleMaxModules : DEFAULT_MAX_MODULES,
+      maxBytes: options.deep ? config.bundleMaxBytes : DEFAULT_MAX_SOURCE_BYTES,
+    });
+
+    // 图里一旦出现 ESM 模块，内联就不再安全，退回重写模式
+    const esmModule = [...graph.modules.values()].find((m) => m.hasEsm);
+    if (esmModule) {
+      logger.debug(`模块 ${esmModule.id} 使用了 ESM 语法，bundle 退回重写模式`);
+      const rewritten = await emitRewrite(pkg, entryPath, source);
+      output = rewritten.output;
+      modeName = 'rewrite';
+      reason = `esm:${esmModule.path}`;
+      modules = 1;
+      external = rewritten.externalCount;
+    } else {
+      logger.info(
+        `打包 ${pkg.name}@${pkg.version}/${entryPath}: ` +
+          `${options.deep ? '深度内联' : '内联'} ${graph.modules.size} 个模块`,
+      );
+      output = emitInlineBundle(pkg, graph, { deep: Boolean(options.deep) });
+      modeName = options.deep ? 'deep-inline-cjs' : 'inline-cjs';
+      modules = graph.modules.size;
+      packages = new Set([...graph.modules.values()].map((m) => m.pkg.name)).size;
+      external = graph.externalCount;
+      unresolvedList = [...graph.unresolved.keys()].filter((k) => !isNodeBuiltinSpec(k));
+      if (graph.truncated) reason = 'truncated';
+    }
+  } else {
+    const rewritten = await emitRewrite(pkg, entryPath, source);
+    output = rewritten.output;
+    modeName = 'rewrite';
+    modules = 1;
+    external = rewritten.externalCount;
+  }
+
+  let minified = false;
+  if (options.minify && config.minify) {
+    const result = minifyJavaScript(output);
+    output = result.code;
+    minified = true;
+    metrics.minifySaved(Math.max(0, result.original - result.minified));
+  }
+
+  return {
+    output,
+    mode: modeName,
+    modules,
+    packages,
+    bytes: Buffer.byteLength(output),
+    minified,
+    reason,
+    external,
+    // 未内联的说明符列表（Node 内置模块会被排除），便于调用方判断产物是否真的自包含
+    unresolved: unresolvedList,
+  };
 }
 
 /**
@@ -451,54 +757,20 @@ async function emitRewrite(pkg, entryId, source, rewriteExternal = true) {
  * @param {import('./store.js').MaterializedPackage} pkg
  * @param {string} entryId
  * @param {object} route
- * @param {{minify:boolean, mode:'auto'|'inline'|'rewrite'}} options
+ * @param {{minify:boolean, mode:'auto'|'inline'|'rewrite', deep?:boolean}} options
  */
 export async function serveBundle(req, res, pkg, entryId, route, options) {
   const method = req.method === 'HEAD' ? 'HEAD' : 'GET';
 
-  const { buffer } = await store.readFile(pkg, entryId);
-  const source = buffer.toString('utf8');
-  const probe = findSpecifiers(source);
+  const startedAt = Date.now();
+  const result = await bundleFile(pkg, entryId, {
+    mode: options.mode,
+    deep: Boolean(options.deep),
+    minify: options.minify,
+  });
+  const elapsedMs = Date.now() - startedAt;
 
-  // 自动选择模式：有 ESM 语法就走重写（合并 ESM 需要完整的模块语义实现）
-  let mode = options.mode;
-  if (mode === 'auto') mode = probe.hasEsm ? 'rewrite' : 'inline';
-
-  let output;
-  let diagnostics;
-
-  if (mode === 'inline') {
-    const graph = await collectGraph(pkg, entryId);
-    // 图里出现任何 ESM 模块，内联就不再安全，退回重写
-    const esmModule = [...graph.modules.values()].find((m) => m.hasEsm);
-    if (esmModule) {
-      logger.debug(`模块 ${esmModule.id} 使用了 ESM 语法，bundle 退回重写模式`);
-      const result = await emitRewrite(pkg, entryId, source, true);
-      output = result.output;
-      diagnostics = { mode: 'rewrite', reason: `esm:${esmModule.id}`, ...result };
-    } else {
-      logger.info(`打包 ${pkg.name}@${pkg.version}/${entryId}: 内联 ${graph.modules.size} 个模块`);
-      output = emitInlineBundle(pkg, entryId, graph.modules, { truncated: graph.truncated });
-      diagnostics = {
-        mode: 'inline-cjs',
-        modules: graph.modules.size,
-        sourceBytes: graph.totalBytes,
-        truncated: graph.truncated,
-      };
-    }
-  } else {
-    const result = await emitRewrite(pkg, entryId, source, true);
-    output = result.output;
-    diagnostics = { mode: 'rewrite', ...result };
-  }
-
-  let body = Buffer.from(output, 'utf8');
-  let minified = false;
-  if (options.minify && config.minify) {
-    const result = minifyJavaScript(body.toString('utf8'));
-    body = Buffer.from(result.code, 'utf8');
-    minified = true;
-  }
+  const body = Buffer.from(result.output, 'utf8');
 
   const headers = {
     'content-type': 'application/javascript; charset=utf-8',
@@ -506,18 +778,22 @@ export async function serveBundle(req, res, pkg, entryId, route, options) {
     'accept-ranges': 'bytes',
     'x-byr-package': pkg.name,
     'x-byr-version': pkg.version,
-    'x-byr-bundle': diagnostics.mode,
-    'x-byr-bundle-modules': String(diagnostics.modules ?? diagnostics.internalCount ?? 0),
+    'x-byr-bundle': result.mode,
+    'x-byr-bundle-modules': String(result.modules),
+    'x-byr-bundle-packages': String(result.packages),
+    'x-byr-bundle-external': String(result.external),
+    'x-byr-bundle-ms': String(elapsedMs),
     'x-powered-by': 'BYR Archive',
   };
-  if (diagnostics.reason) headers['x-byr-bundle-reason'] = diagnostics.reason;
-  if (minified) headers['x-byr-minified'] = 'true';
+  if (result.reason) headers['x-byr-bundle-reason'] = result.reason;
+  if (result.minified) headers['x-byr-minified'] = 'true';
   if (config.cors) headers['access-control-allow-origin'] = '*';
+  if (config.securityHeaders) headers['x-content-type-options'] = 'nosniff';
 
   const encoding = compress.negotiate(req.headers['accept-encoding']);
-  if (encoding !== 'identity') {
+  if (encoding !== 'identity' && body.length >= 1024) {
     const compressed = await compress.compress(
-      `bundle:${config.registry}|${pkg.name}@${pkg.version}/${entryId}|${diagnostics.mode}|${minified}`,
+      `bundle:${config.registry}|${pkg.name}@${pkg.version}/${entryId}|${result.mode}|${result.minified}|${result.modules}`,
       body,
       encoding,
     );
@@ -525,6 +801,7 @@ export async function serveBundle(req, res, pkg, entryId, route, options) {
       headers['content-encoding'] = encoding;
       headers.vary = 'accept-encoding';
       headers['content-length'] = String(compressed.length);
+      metrics.compressionSaved(body.length - compressed.length, encoding);
       res.writeHead(200, headers);
       res.end(method === 'HEAD' ? undefined : compressed);
       return;
@@ -536,4 +813,11 @@ export async function serveBundle(req, res, pkg, entryId, route, options) {
   res.end(method === 'HEAD' ? undefined : body);
 }
 
-export default { serveBundle, findSpecifiers, resolveRelativeSpec, splitBareSpec, cdnUrl };
+export default {
+  serveBundle,
+  bundleFile,
+  findSpecifiers,
+  resolveRelativeSpec,
+  splitBareSpec,
+  cdnUrl,
+};

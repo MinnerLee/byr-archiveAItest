@@ -20,6 +20,18 @@ import { resolveEntry, normalizeEntryPath } from '../src/entry.js';
 import { parseRange } from '../src/handler.js';
 import { findSpecifiers, resolveRelativeSpec, splitBareSpec } from '../src/bundle.js';
 import { start } from '../src/server.js';
+import { parseArgs, parsePackageSpec } from '../src/cli.js';
+import { parseNpmrc, findAuth, authKeyPrefix } from '../src/npmrc.js';
+import { createSemaphore } from '../src/semaphore.js';
+import { createRateLimiter, clientKey } from '../src/ratelimit.js';
+import { setRateLimit } from '../src/handler.js';
+import {
+  // `metrics` 是 metrics.js 里的一个「语义化封装对象」，它本身就是被导入的东西
+  metrics as metricsGlobal,
+  renderPrometheus,
+  snapshot as metricsSnapshot,
+  reset as resetMetrics,
+} from '../src/metrics.js';
 
 /* ------------------------------------------------------------------ */
 /* 迷你测试框架                                                         */
@@ -113,6 +125,26 @@ function testSemver() {
     assert.equal(semver.satisfies('1.5.0', '1.2.3 - 1.8.0'), true);
     assert.equal(semver.satisfies('1.9.0', '1.2.3 - 1.8.0'), false);
     assert.equal(semver.satisfies('99.0.0', '*'), true);
+  });
+
+  check('通配符展开必须尊重原比较符（回归用例）', () => {
+    // 这个 bug 是在深度打包 safer-buffer 时暴露的：
+    // 依赖范围 `>= 2.1.2 < 3` 里的 `< 3` 曾被错误展开成 `>=3.0.0 <4.0.0`
+    assert.equal(semver.satisfies('2.1.4', '>= 2.1.2 < 3'), true);
+    assert.equal(semver.satisfies('2.1.2', '>= 2.1.2 < 3'), true);
+    assert.equal(semver.satisfies('2.1.1', '>= 2.1.2 < 3'), false);
+    assert.equal(semver.satisfies('3.0.0', '>= 2.1.2 < 3'), false);
+
+    assert.equal(semver.satisfies('2.0.0', '>1.x'), true);
+    assert.equal(semver.satisfies('1.5.0', '>1.x'), false);
+    assert.equal(semver.satisfies('0.9.0', '<1.x'), true);
+    assert.equal(semver.satisfies('1.9.9', '<1.x'), false);
+    assert.equal(semver.satisfies('1.2.9', '<=1.2.x'), true);
+    assert.equal(semver.satisfies('1.3.0', '<=1.2.x'), false);
+    assert.equal(semver.satisfies('1.2.0', '>=1.2.x'), true);
+    assert.equal(semver.satisfies('1.1.9', '>=1.2.x'), false);
+    assert.equal(semver.satisfies('2.5.0', '>1'), true);
+    assert.equal(semver.satisfies('1.9.0', '>1'), false);
   });
 
   check('预发布版本默认不参与匹配', () => {
@@ -437,6 +469,217 @@ function testRange() {
   });
 }
 
+
+/* ------------------------------------------------------------------ */
+/* 9. CLI 参数解析                                                      */
+/* ------------------------------------------------------------------ */
+
+function testCliParsing() {
+  section('9. CLI 参数解析');
+
+  check('位置参数与 --flag value 分离', () => {
+    const { positional, flags } = parseArgs(['info', 'vue@3.3.4', '--json', '--registry', 'https://x.test']);
+    assert.deepEqual(positional, ['info', 'vue@3.3.4']);
+    assert.equal(flags['--json'], true);
+    assert.equal(flags['--registry'], 'https://x.test');
+  });
+
+  check('--key=value 形式', () => {
+    const { flags } = parseArgs(['--port=9090']);
+    assert.equal(flags['--port'], '9090');
+  });
+
+  check('短参数别名', () => {
+    const { flags } = parseArgs(['-j', '-s', '-o', 'out.js']);
+    assert.equal(flags['--json'], true);
+    assert.equal(flags['--stats'], true);
+    assert.equal(flags['--out'], 'out.js');
+  });
+
+  check('包名与版本拆分（普通包）', () => {
+    assert.deepEqual(parsePackageSpec('vue'), { name: 'vue', version: '' });
+    assert.deepEqual(parsePackageSpec('vue@3.3.4'), { name: 'vue', version: '3.3.4' });
+    assert.deepEqual(parsePackageSpec('vue@^3.2.0'), { name: 'vue', version: '^3.2.0' });
+  });
+
+  check('包名与版本拆分（scoped 包）', () => {
+    assert.deepEqual(parsePackageSpec('@vue/shared'), { name: '@vue/shared', version: '' });
+    assert.deepEqual(parsePackageSpec('@vue/shared@3.4.21'), { name: '@vue/shared', version: '3.4.21' });
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 10. .npmrc 解析                                                      */
+/* ------------------------------------------------------------------ */
+
+function testNpmrc() {
+  section('10. .npmrc 解析');
+
+  check('基本键值、注释、引号、环境变量插值', () => {
+    const parsed = parseNpmrc(
+      [
+        '# 注释行',
+        '; 另一种注释',
+        'registry=https://npm.company.com/',
+        '//npm.company.com/:_authToken="tok-123"',
+        '  spaced  =  value  ',
+        '_auth=${MY_AUTH}',
+      ].join('\n'),
+      { MY_AUTH: 'base64stuff' },
+    );
+    assert.equal(parsed.registry, 'https://npm.company.com/');
+    assert.equal(parsed['//npm.company.com/:_authToken'], 'tok-123');
+    assert.equal(parsed.spaced, 'value');
+    assert.equal(parsed._auth, 'base64stuff');
+  });
+
+  check('authKeyPrefix 规范化（补协议、补尾斜杠）', () => {
+    assert.equal(authKeyPrefix('https://npm.company.com'), '//npm.company.com/');
+    assert.equal(authKeyPrefix('https://npm.company.com/'), '//npm.company.com/');
+    assert.equal(authKeyPrefix('https://npm.company.com/sub'), '//npm.company.com/sub/');
+    assert.equal(authKeyPrefix('http://localhost:4873/'), '//localhost:4873/');
+  });
+
+  check('findAuth 依次尝试精确键、host 键、_auth', () => {
+    const npmrc = {
+      '//registry.npmjs.org/:_authToken': 'exact',
+      '//other.com/:_authToken': 'other',
+      _auth: 'fallback',
+    };
+    assert.equal(findAuth(npmrc, 'https://registry.npmjs.org'), 'exact');
+    assert.equal(findAuth(npmrc, 'https://unknown.com'), 'fallback');
+  });
+
+  check('没有匹配键且无 _auth 时返回空串', () => {
+    assert.equal(findAuth({}, 'https://registry.npmjs.org'), '');
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 11. 信号量与限流                                                     */
+/* ------------------------------------------------------------------ */
+
+async function testConcurrencyAndRateLimit() {
+  section('11. 信号量与限流');
+
+  await checkAsync('信号量：并发不超过上限，且任务全部完成', async () => {
+    const sem = createSemaphore(3);
+    let active = 0;
+    let peak = 0;
+    let done = 0;
+
+    await Promise.all(
+      Array.from({ length: 12 }, () =>
+        sem.run(async () => {
+          active += 1;
+          peak = Math.max(peak, active);
+          await new Promise((r) => setTimeout(r, 5));
+          active -= 1;
+          done += 1;
+        }),
+      ),
+    );
+
+    assert.equal(done, 12);
+    assert.ok(peak <= 3, `峰值并发 ${peak} 超过了上限 3`);
+    assert.equal(sem.stats().peakActive, peak);
+    assert.equal(sem.stats().completed, 12);
+  });
+
+  await checkAsync('信号量：任务抛错后仍然释放名额', async () => {
+    const sem = createSemaphore(1);
+    await sem.run(async () => {}).catch(() => {});
+    await assert.rejects(() => sem.run(async () => { throw new Error('boom'); }), /boom/);
+    // 名额必须已经释放，否则这里会一直挂着
+    await sem.run(async () => {});
+    assert.equal(sem.stats().active, 0);
+  });
+
+  check('限流：关闭时永远放行', () => {
+    const limiter = createRateLimiter({ perMinute: 0 });
+    assert.equal(limiter.enabled, false);
+    for (let i = 0; i < 100; i += 1) assert.equal(limiter.check('k'), null);
+  });
+
+  check('限流：超出突发容量后拒绝，并给出 Retry-After', () => {
+    const limiter = createRateLimiter({ perMinute: 60, burst: 3 });
+    assert.equal(limiter.check('a'), null);
+    assert.equal(limiter.check('a'), null);
+    assert.equal(limiter.check('a'), null);
+    const rejected = limiter.check('a');
+    assert.ok(rejected, '第 4 次应被拒绝');
+    assert.equal(rejected.limit, 60);
+    assert.equal(rejected.remaining, 0);
+    assert.ok(rejected.retryAfter >= 1);
+    // 不同 key 之间互不影响
+    assert.equal(limiter.check('b'), null);
+  });
+
+  await checkAsync('限流：等待后令牌会恢复', async () => {
+    // 每分钟 6000 个令牌 = 每毫秒 0.1 个，100ms 恢复 10 个
+    const limiter = createRateLimiter({ perMinute: 6000, burst: 1 });
+    assert.equal(limiter.check('c'), null);
+    assert.ok(limiter.check('c'), '应被拒绝');
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(limiter.check('c'), null, '短暂等待后应恢复放行');
+  });
+
+  check('限流：桶数量有上限（LRU 淘汰），不会被海量 key 撑爆', () => {
+    const limiter = createRateLimiter({ perMinute: 600, burst: 10, maxKeys: 5 });
+    for (let i = 0; i < 100; i += 1) limiter.check(`key-${i}`);
+    assert.ok(limiter.stats().tracked <= 5, `跟踪的桶数 ${limiter.stats().tracked} 超过上限`);
+  });
+
+  check('clientKey：默认用 socket 地址，trustProxy 时才用 X-Forwarded-For', () => {
+    const req = { headers: { 'x-forwarded-for': '1.2.3.4, 5.6.7.8' }, socket: { remoteAddress: '127.0.0.1' } };
+    assert.equal(clientKey(req, false), '127.0.0.1');
+    assert.equal(clientKey(req, true), '1.2.3.4');
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 12. 指标导出                                                         */
+/* ------------------------------------------------------------------ */
+
+function testMetrics() {
+  section('12. Prometheus 指标导出');
+
+  check('指标能渲染成 Prometheus 文本格式', () => {
+    resetMetrics();
+
+    metricsGlobal.httpRequest({ method: 'GET', status: 200, durationSeconds: 0.012, bytes: 100, encoding: 'gzip' });
+    metricsGlobal.httpRequest({ method: 'GET', status: 404, durationSeconds: 0.003, bytes: 0, encoding: 'identity' });
+    metricsGlobal.cacheAccess('memory', true);
+    metricsGlobal.compressionSaved(500, 'gzip');
+    metricsGlobal.upstreamRequest('tarball', true);
+
+    const text = renderPrometheus();
+
+    assert.ok(text.includes('# TYPE byr_http_requests_total counter'), '应有 TYPE 声明');
+    assert.ok(text.includes('byr_http_requests_total{method="GET",status="200"} 1'));
+    assert.ok(text.includes('byr_http_requests_total{method="GET",status="404"} 1'));
+    assert.ok(text.includes('byr_cache_hits_total{layer="memory"} 1'));
+    assert.ok(text.includes('byr_compression_bytes_saved_total{encoding="gzip"} 500'));
+    assert.ok(text.includes('byr_upstream_requests_total{kind="tarball",result="ok"} 1'));
+    assert.ok(/byr_http_request_duration_seconds_bucket\{.*le="\+Inf"\} 2/.test(text), '直方图应有 +Inf 桶');
+    assert.ok(text.includes('byr_http_request_duration_seconds_count{method="GET"} 2'));
+    assert.ok(text.includes('process_uptime_seconds'));
+    assert.ok(text.includes('byr_event_loop_lag_seconds'), '应包含事件循环延迟');
+    resetMetrics();
+  });
+
+  check('JSON 快照包含计数器与直方图', () => {
+    resetMetrics();
+    metricsGlobal.httpRequest({ method: 'GET', status: 200, durationSeconds: 0.02, bytes: 10, encoding: 'identity' });
+    const snap = metricsSnapshot();
+    assert.ok(snap.counters['byr_http_requests_total{method="GET",status="200"}'] === 1);
+    assert.ok(snap.histograms['byr_http_request_duration_seconds{method="GET"}'].count === 1);
+    assert.ok(snap.eventLoop);
+    assert.ok(snap.memory.rss > 0);
+    resetMetrics();
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* 8. 端到端（需要网络）                                                */
 /* ------------------------------------------------------------------ */
@@ -702,6 +945,242 @@ async function testEndToEnd(port) {
   });
 }
 
+
+/* ------------------------------------------------------------------ */
+/* 13. 加分项的端到端验证                                              */
+/* ------------------------------------------------------------------ */
+
+async function testBonusEndToEnd(port) {
+  section('13. 加分项端到端（指标 / API / 安全头 / 条件请求 / 深打包 / 限流）');
+
+  // ---- 监控指标 ----
+  await checkAsync('GET /_metrics → Prometheus 文本格式', async () => {
+    const res = await request(port, '/_metrics');
+    assert.equal(res.status, 200);
+    assert.match(String(res.headers['content-type']), /text\/plain/);
+    const text = res.body.toString();
+    assert.ok(text.includes('# TYPE byr_http_requests_total counter'), '应含计数器声明');
+    assert.ok(text.includes('byr_http_requests_total{method="GET"'), '应记录到刚才的请求');
+    assert.ok(text.includes('byr_cache_hits_total'), '应含缓存命中统计');
+    assert.ok(text.includes('byr_cache_hits_total{layer="extracted"}'), '应记录到解包层的缓存命中');
+    // 直方图与流量统计（这两个一定会有数据；上游请求数在缓存全热时可能为 0）
+    assert.ok(text.includes('byr_http_request_duration_seconds_count{method="GET"}'), '应含请求耗时直方图');
+    assert.ok(/byr_http_request_duration_seconds_bucket\{.*le="0\.1"\}/.test(text), '应含分桶边界');
+    assert.ok(text.includes('byr_http_bytes_sent_total'), '应含发送字节统计');
+    assert.ok(text.includes('byr_event_loop_lag_seconds'), '应含事件循环延迟');
+    assert.ok(text.includes('process_uptime_seconds'), '应含进程运行时长');
+  });
+
+  await checkAsync('GET /_stats → 含解包信号量、限流、指标快照与上游来源', async () => {
+    const res = await request(port, '/_stats');
+    assert.equal(res.status, 200);
+    const payload = JSON.parse(res.body.toString());
+    assert.ok(payload.upstream.registry, '应含上游地址');
+    assert.ok(payload.upstream.source, '应说明上游地址的来源');
+    assert.ok(payload.extraction && typeof payload.extraction.limit === 'number', '应含解包信号量状态');
+    assert.ok(payload.rateLimit && typeof payload.rateLimit.enabled === 'boolean', '应含限流状态');
+    assert.ok(payload.metrics && payload.metrics.counters, '应含指标快照');
+  });
+
+  // ---- 安全响应头 ----
+  await checkAsync('文件响应带 X-Content-Type-Options: nosniff', async () => {
+    const res = await request(port, '/vue@3.3.4/package.json');
+    assert.equal(res.headers['x-content-type-options'], 'nosniff');
+  });
+
+  await checkAsync('目录列表页带 CSP 与 Referrer-Policy', async () => {
+    const res = await request(port, '/vue@3.3.4/');
+    const csp = String(res.headers['content-security-policy'] || '');
+    assert.ok(csp.includes("default-src 'none'"), `CSP 缺失或不对: ${csp}`);
+    assert.ok(csp.includes("base-uri 'none'"), '应禁止 base 标签注入');
+    assert.equal(res.headers['referrer-policy'], 'no-referrer');
+  });
+
+  // ---- 条件请求 ----
+  await checkAsync('Last-Modified 对同一版本是稳定的（不再是每次请求都变）', async () => {
+    const first = await request(port, '/vue@3.3.4/package.json');
+    await new Promise((r) => setTimeout(r, 1100)); // 跨过一个整秒，确认不是「当前时间」
+    const second = await request(port, '/vue@3.3.4/package.json');
+    assert.equal(first.headers['last-modified'], second.headers['last-modified']);
+    assert.ok(first.headers['last-modified'], '应返回 Last-Modified');
+  });
+
+  await checkAsync('If-Modified-Since 命中 → 304 且无 body', async () => {
+    const first = await request(port, '/vue@3.3.4/package.json');
+    const lm = first.headers['last-modified'];
+    const second = await request(port, '/vue@3.3.4/package.json', {
+      headers: { 'if-modified-since': lm },
+    });
+    assert.equal(second.status, 304);
+    assert.equal(second.body.length, 0);
+  });
+
+  await checkAsync('If-Modified-Since 早于 Last-Modified → 正常 200', async () => {
+    const res = await request(port, '/vue@3.3.4/package.json', {
+      headers: { 'if-modified-since': 'Thu, 01 Jan 1970 00:00:00 GMT' },
+    });
+    assert.equal(res.status, 200);
+    assert.ok(res.body.length > 0);
+  });
+
+  await checkAsync('If-None-Match 优先级高于 If-Modified-Since（RFC 7232）', async () => {
+    const first = await request(port, '/vue@3.3.4/package.json');
+    const res = await request(port, '/vue@3.3.4/package.json', {
+      headers: {
+        'if-none-match': '"definitely-not-matching"',
+        'if-modified-since': first.headers['last-modified'],
+      },
+    });
+    // ETag 不匹配时不能用 If-Modified-Since 判定，必须返回完整内容
+    assert.equal(res.status, 200);
+  });
+
+  // ---- 包信息 API ----
+  await checkAsync('GET /_api/vue@3.3.4 → 概览（版本 / 入口 / 体积）', async () => {
+    const res = await request(port, '/_api/vue@3.3.4');
+    assert.equal(res.status, 200);
+    assert.match(String(res.headers['content-type']), /application\/json/);
+    const payload = JSON.parse(res.body.toString());
+    assert.equal(payload.resolved.version, '3.3.4');
+    assert.equal(payload.resolved.how, 'exact');
+    assert.equal(payload.entry.path, 'dist/vue.global.js');
+    assert.equal(payload.entry.source, 'jsdelivr');
+    assert.equal(payload.entry.contentType, 'application/javascript; charset=utf-8');
+    assert.ok(payload.contents.files > 0);
+    assert.ok(payload.contents.bytesHuman);
+    assert.equal(payload.upstream.registry, 'https://registry.npmjs.org');
+  });
+
+  await checkAsync('GET /_api/vue@3.3.4/tree → 完整文件树带 url 与 contentType', async () => {
+    const res = await request(port, '/_api/vue@3.3.4/tree');
+    assert.equal(res.status, 200);
+    const payload = JSON.parse(res.body.toString());
+    assert.ok(payload.count > 10, `文件数 ${payload.count} 不合理`);
+    const entry = payload.files.find((f) => f.path === 'package.json');
+    assert.ok(entry, '树里应包含 package.json');
+    assert.equal(entry.contentType, 'application/json; charset=utf-8');
+    assert.ok(entry.url.includes('/npm/vue@3.3.4/package.json'));
+  });
+
+  await checkAsync('GET /_api/vue@3.3.4/dir/dist → 目录 JSON（区分文件与子目录）', async () => {
+    const res = await request(port, '/_api/vue@3.3.4/dir/dist');
+    assert.equal(res.status, 200);
+    const payload = JSON.parse(res.body.toString());
+    assert.equal(payload.dir, 'dist');
+    assert.ok(payload.files.length > 5, `dist 下文件数 ${payload.files.length} 不合理`);
+    assert.ok(payload.files.every((f) => f.path.startsWith('dist/')), '文件路径应带目录前缀');
+    assert.ok(payload.files.every((f) => f.url && f.contentType), '每项应有 url 与 contentType');
+  });
+
+  await checkAsync('GET /_api/vue@3.3.4/file/{路径} → 文件元信息与变体 URL', async () => {
+    const res = await request(port, '/_api/vue@3.3.4/file/dist/vue.global.js');
+    assert.equal(res.status, 200);
+    const payload = JSON.parse(res.body.toString());
+    assert.equal(payload.path, 'dist/vue.global.js');
+    assert.equal(payload.contentType, 'application/javascript; charset=utf-8');
+    assert.ok(payload.size > 1000);
+    assert.ok(payload.variants.minified.endsWith('?min'));
+    assert.ok(payload.variants.bundled.endsWith('?bundle'));
+    assert.ok(payload.variants.esmRewritten.endsWith('?esm'));
+  });
+
+  await checkAsync('GET /_api/{包}/不认识的子命令 → 400 且给出可用选项', async () => {
+    const res = await request(port, '/_api/vue@3.3.4/bogus');
+    assert.equal(res.status, 400);
+    const payload = JSON.parse(res.body.toString());
+    assert.match(payload.error, /tree|dir|file/);
+  });
+
+  await checkAsync('GET /_api/{不存在的包} → 404', async () => {
+    const res = await request(port, '/_api/this-package-does-not-exist-byr');
+    assert.equal(res.status, 404);
+  });
+
+  // ---- 无 main / exports 的包 ----
+  await checkAsync('无 main/exports 的包 → 404 且带上解释与解决办法', async () => {
+    const res = await request(port, '/express@4.18.2');
+    assert.equal(res.status, 404);
+    const payload = JSON.parse(res.body.toString());
+    assert.ok(payload.hint, '应给出 hint 说明原因');
+    assert.match(payload.hint, /ENTRY_NODE_DEFAULT/);
+    assert.equal(payload.nodeDefaultCandidate, 'index.js');
+    // 直接访问 index.js 仍然可用
+    const direct = await request(port, '/express@4.18.2/index.js');
+    assert.equal(direct.status, 200);
+  });
+
+  // ---- 深度打包 ----
+  await checkAsync('?bundle=deep 递归内联外部依赖（cookie-parser，1 → 3 个包）', async () => {
+    const res = await request(port, '/cookie-parser@1.4.6/index.js?bundle=deep');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers['x-byr-bundle'], 'deep-inline-cjs');
+    assert.ok(Number(res.headers['x-byr-bundle-modules']) >= 3, '应内联 3 个以上模块');
+    assert.ok(Number(res.headers['x-byr-bundle-packages']) >= 2, '应涉及 2 个以上包');
+    const text = res.body.toString();
+    assert.ok(text.includes('deep-inline'), '产物横幅应标明深度模式');
+    assert.ok(text.includes('function (module, exports, require'), '应含模块定义');
+  });
+
+  await checkAsync('普通 ?bundle 不内联外部依赖（与 deep 模式形成对照）', async () => {
+    const plain = await request(port, '/cookie-parser@1.4.6/index.js?bundle');
+    const deep = await request(port, '/cookie-parser@1.4.6/index.js?bundle=deep');
+    assert.equal(plain.headers['x-byr-bundle'], 'inline-cjs');
+    assert.equal(Number(plain.headers['x-byr-bundle-packages']), 1);
+    assert.ok(Number(deep.headers['x-byr-bundle-packages']) > Number(plain.headers['x-byr-bundle-packages']));
+    assert.ok(deep.body.length > plain.body.length, '深度产物应该更大');
+  });
+
+  await checkAsync('深度打包产物在 Node 中真实可用（mime，零依赖自包含）', async () => {
+    const res = await request(port, '/mime@3.0.0/index.js?bundle=deep');
+    assert.equal(res.status, 200);
+
+    // 用 vm 在当前进程里按 CommonJS 语义执行产物。
+    // 比 spawn 一个子进程更好：不需要落盘、不依赖外部可执行文件，
+    // 也就不会在 Windows 上因为「进程正在运行自己」而报 EBUSY。
+    const vm = await import('node:vm');
+    const { createRequire } = await import('node:module');
+
+    const module = { exports: {} };
+    const runner = vm.compileFunction(
+      res.body.toString('utf8'),
+      ['module', 'exports', 'require', '__filename', '__dirname'],
+      { filename: 'byr-bundle.cjs' },
+    );
+    runner(module, module.exports, createRequire(import.meta.url), '/bundle.cjs', '/');
+
+    assert.equal(module.exports.getType('a.json'), 'application/json');
+    assert.equal(Object.keys(module.exports._types).length, 1173);
+  });
+
+  // ---- 限流 ----
+  await checkAsync('开启限流后超出额度 → 429 且带 Retry-After 与 X-RateLimit-*', async () => {
+    setRateLimit(30, 5); // 突发 5 次
+    try {
+      let rejected = null;
+      for (let i = 0; i < 12; i += 1) {
+        const res = await request(port, '/_health');
+        if (res.status === 429) {
+          rejected = res;
+          break;
+        }
+      }
+      assert.ok(rejected, '连续请求后应出现 429');
+      assert.ok(Number(rejected.headers['retry-after']) >= 1, '应带 Retry-After');
+      assert.equal(rejected.headers['x-ratelimit-limit'], '30');
+      assert.equal(rejected.headers['x-ratelimit-remaining'], '0');
+      const payload = JSON.parse(rejected.body.toString());
+      assert.equal(payload.status, 429);
+    } finally {
+      setRateLimit(0, 0); // 关闭限流，避免影响其它用例
+    }
+  });
+
+  await checkAsync('关闭限流后恢复正常', async () => {
+    const res = await request(port, '/_health');
+    assert.equal(res.status, 200);
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* 主流程                                                              */
 /* ------------------------------------------------------------------ */
@@ -716,6 +1195,10 @@ async function main() {
   testMinify();
   testBundleHelpers();
   testRange();
+  testCliParsing();
+  testNpmrc();
+  await testConcurrencyAndRateLimit();
+  testMetrics();
 
   const online = await hasNetwork();
   if (!online) {
@@ -726,6 +1209,7 @@ async function main() {
     process.stdout.write(`\n(测试服务监听 127.0.0.1:${port})\n`);
     try {
       await testEndToEnd(port);
+      await testBonusEndToEnd(port);
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }

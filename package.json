@@ -1,6 +1,6 @@
 {
   "name": "byr-archive",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "BYR Archive —— 一个最简版的 jsDelivr：从 npm registry 拉取包并直接对外提供文件、目录与入口文件服务",
   "type": "module",
   "engines": {
@@ -10,6 +10,15 @@
     "byr-archive": "./src/index.js"
   },
   "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./server": "./src/server.js",
+    "./store": "./src/store.js",
+    "./semver": "./src/semver.js",
+    "./minify": "./src/minify.js",
+    "./bundle": "./src/bundle.js",
+    "./api": "./src/api.js"
+  },
   "files": [
     "src",
     "README.md",
@@ -18,14 +27,20 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node test/smoke.mjs"
+    "test": "node test/smoke.mjs",
+    "bench": "node test/benchmark.mjs",
+    "cli": "node src/index.js",
+    "verify:lodash": "node src/index.js verify lodash",
+    "verify:vue": "node src/index.js verify vue@3.3.4"
   },
   "keywords": [
     "jsdelivr",
     "cdn",
     "npm",
     "registry",
-    "proxy"
+    "proxy",
+    "tarball",
+    "semver"
   ],
   "license": "MIT",
   "dependencies": {}
