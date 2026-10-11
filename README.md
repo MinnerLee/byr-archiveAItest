@@ -184,6 +184,7 @@ test/
   acceptance.mjs 74 项对抗性验收（注入 / 越界 / 并发 / 中断 / 资源）
   verify-live.mjs   48 项独立进程验收（spawn 真实服务与 CLI 子进程）
   live-check.sh     70 项真实客户端验收（curl 打独立进程，任何人可复现）
+  final-check.sh    一键跑 ④+⑥：起服务 → curl 验收 → Chrome 验收 → 停服务
   fixtures/         优雅退出探针等测试夹具
   benchmark.mjs  11 个方面的基准测量
 docs/
@@ -202,11 +203,13 @@ npm run test:acceptance     # ② 74 项对抗性验收（注入 / 越界 / 并�
 npm run test:live           # ③ 48 项独立进程验收（spawn 真实服务进程与 CLI 子进程）
 npm run bench               # ⑤ 基准测量，打印体积/耗时/压缩率
 
-# ④ 真实客户端验收（需先独立起服务，只用 curl）
-PORT=18080 node src/index.js &
-bash test/live-check.sh http://127.0.0.1:18080
+# ④+⑥ 一键跑完「需要真实环境」的两层：
+#      自动起服务 → curl 验收 → Chrome 验收 → 自动停服务
+npm run test:final
 
-# ⑥ 真实浏览器验收（用本机 Chrome 加载演示页）
+# 也可以手工来：
+#   PORT=18080 node src/index.js &
+#   bash test/live-check.sh http://127.0.0.1:18080
 #   chrome --headless=new --virtual-time-budget=25000 \
 #          --dump-dom "file:///<repo>/docs/browser-demo.html"
 
@@ -222,9 +225,9 @@ node src/index.js info vue@3.3.4
 | ① 功能 | `npm test` | 120 项通过 |
 | ② 对抗性 | `npm run test:acceptance` | 74 PASS / 0 FAIL / 3 WARN |
 | ③ 独立进程 | `npm run test:live` | 48 项通过 |
-| ④ 真实客户端（独立进程 + curl） | `bash test/live-check.sh` | 70 PASS / 0 FAIL |
+| ④ 真实客户端（独立进程 + curl） | `npm run test:final` | 70 PASS / 0 FAIL |
 | ⑤ 基准 | `npm run bench` | 11 节数据 |
-| ⑥ 真实浏览器（Chrome） | `docs/browser-demo.html` | 11/11 通过 |
+| ⑥ 真实浏览器（Chrome） | `npm run test:final` | 11/11 通过 |
 
 每一层加的都不是「更多用例」，而是「**更多真实成分**」——第 ⑥ 层抓到了一个 Node 侧怎么测都测不到的缺陷（`?esm` 非传递重写），第 ③ 层又抓出了 CLI 在非 TTY 下输出颜色码的问题。
 
